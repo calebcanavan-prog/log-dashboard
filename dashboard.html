@@ -1,0 +1,909 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Alpha Hunter — Trading Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  html, body, #root { margin: 0; padding: 0; background: #070b12; min-height: 100vh; }
+  * { box-sizing: border-box; }
+  body { font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', 'Menlo', monospace; color: #e4e9f0; }
+  button { font-family: inherit; }
+  input { font-family: inherit; }
+  code { font-family: inherit; font-size: 0.92em; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: #0b1220; }
+  ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 5px; }
+  ::-webkit-scrollbar-thumb:hover { background: #334155; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spin { animation: spin 0.9s linear infinite; }
+  @keyframes pulseDot { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+  .pulse { animation: pulseDot 1.8s ease-in-out infinite; }
+</style>
+
+<!-- React 18 + Recharts + Babel (for in-browser JSX) -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/prop-types@15/prop-types.min.js"></script>
+<script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-type="module">
+const { useState, useMemo, useRef, useEffect, useCallback } = React;
+const {
+  XAxis, YAxis, Tooltip, ResponsiveContainer,
+  BarChart, Bar, Cell, CartesianGrid, Area, AreaChart, ReferenceLine
+} = Recharts;
+
+// ─── Sample data (used until the user imports real trades) ──────────────────
+const DEFAULT_TRADES = [
+  { id: 1,  date: "2026-04-16", time: "09:31", ticker: "SOXL",     mode: "Strategy D", setup: "EMA5",  entry: 83.94,   exit: 86.12,   qty: 11,   pnl: 23.98,  reason: "ema5_exit" },
+  { id: 2,  date: "2026-04-16", time: "09:46", ticker: "SOXL",     mode: "Strategy D", setup: "RSI30", entry: 85.12,   exit: 83.92,   qty: 11,   pnl: -13.20, reason: "stop_loss" },
+  { id: 3,  date: "2026-04-16", time: "10:01", ticker: "SOXL",     mode: "Strategy D", setup: "RSI32", entry: 84.55,   exit: 88.50,   qty: 11,   pnl: 43.45,  reason: "ema5_exit" },
+  { id: 4,  date: "2026-04-16", time: "10:15", ticker: "TQQQ",     mode: "ORB",        setup: "ORB",   entry: 72.14,   exit: 73.88,   qty: 13,   pnl: 22.62,  reason: "target_2R" },
+  { id: 5,  date: "2026-04-16", time: "12:01", ticker: "SOXL",     mode: "Strategy D", setup: "EMA5",  entry: 88.93,   exit: 88.61,   qty: 11,   pnl: -3.52,  reason: "stop_loss" },
+  { id: 6,  date: "2026-04-16", time: "12:26", ticker: "SOXL",     mode: "Strategy D", setup: "EMA5",  entry: 88.66,   exit: 88.67,   qty: 11,   pnl: 0.11,   reason: "trailing_stop" },
+  { id: 7,  date: "2026-04-16", time: "12:36", ticker: "SOXS",     mode: "Strategy D", setup: "EMA20", entry: 20.53,   exit: 20.38,   qty: 48,   pnl: -7.20,  reason: "stop_loss" },
+  { id: 8,  date: "2026-04-16", time: "13:46", ticker: "ETH/USD",  mode: "ETH",        setup: "EMA5",  entry: 2327.40, exit: 2324.48, qty: 0.43, pnl: -1.25,  reason: "be_stop" },
+  { id: 9,  date: "2026-04-16", time: "14:02", ticker: "DOGE/USD", mode: "HA Scalper", setup: "HA",    entry: 0.1821,  exit: 0.1834,  qty: 5500, pnl: 7.15,   reason: "target" },
+  { id: 10, date: "2026-04-16", time: "14:31", ticker: "ETH/USD",  mode: "ETH",        setup: "RSI36", entry: 2327.00, exit: 2332.88, qty: 0.43, pnl: 2.52,   reason: "target" },
+  { id: 11, date: "2026-04-16", time: "15:21", ticker: "ETH/USD",  mode: "ETH",        setup: "EMA5",  entry: 2341.69, exit: 2358.60, qty: 0.43, pnl: 7.21,   reason: "target" },
+  { id: 12, date: "2026-04-15", time: "09:36", ticker: "SOXL",     mode: "Strategy D", setup: "EMA5",  entry: 84.75,   exit: 86.12,   qty: 11,   pnl: 15.07,  reason: "trailing_stop" },
+  { id: 13, date: "2026-04-15", time: "10:26", ticker: "SOXL",     mode: "Strategy D", setup: "EMA5",  entry: 84.43,   exit: 84.13,   qty: 11,   pnl: -3.30,  reason: "stop_loss" },
+  { id: 14, date: "2026-04-15", time: "10:48", ticker: "SQQQ",     mode: "ORB",        setup: "ORB",   entry: 18.42,   exit: 18.19,   qty: 54,   pnl: -12.42, reason: "stop_loss" },
+  { id: 15, date: "2026-04-15", time: "11:30", ticker: "SOL/USD",  mode: "HA Scalper", setup: "HA",    entry: 142.15,  exit: 143.88,  qty: 7,    pnl: 12.11,  reason: "target" },
+  { id: 16, date: "2026-04-15", time: "13:01", ticker: "SOXL",     mode: "Strategy D", setup: "RSI30", entry: 80.98,   exit: 81.82,   qty: 12,   pnl: 7.44,   reason: "trailing_stop" },
+  { id: 17, date: "2026-04-15", time: "13:52", ticker: "SOXL",     mode: "Strategy D", setup: "EMA5",  entry: 81.88,   exit: 85.69,   qty: 12,   pnl: 45.72,  reason: "eod_close" },
+  { id: 18, date: "2026-04-15", time: "14:46", ticker: "SOXS",     mode: "Strategy D", setup: "EMA20", entry: 21.96,   exit: 21.90,   qty: 45,   pnl: -2.70,  reason: "stop_loss" },
+  { id: 19, date: "2026-04-15", time: "15:01", ticker: "SOXS",     mode: "Strategy D", setup: "EMA20", entry: 21.99,   exit: 21.69,   qty: 45,   pnl: -13.50, reason: "stop_loss" },
+];
+
+const LS_URL = "alpha_hunter_sheets_url";
+
+// ─── Tiny CSV parser that handles quoted fields with commas ────────────────
+function parseCSV(text) {
+  const rows = [];
+  let cur = [""], inQ = false, i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    if (inQ) {
+      if (c === '"' && text[i + 1] === '"') { cur[cur.length - 1] += '"'; i += 2; continue; }
+      if (c === '"') { inQ = false; i++; continue; }
+      cur[cur.length - 1] += c; i++;
+    } else {
+      if (c === '"') { inQ = true; i++; continue; }
+      if (c === ",") { cur.push(""); i++; continue; }
+      if (c === "\n") { rows.push(cur); cur = [""]; i++; continue; }
+      if (c === "\r") { i++; continue; }
+      cur[cur.length - 1] += c; i++;
+    }
+  }
+  if (cur.length > 1 || cur[0] !== "") rows.push(cur);
+  return rows;
+}
+
+// Map a row object (from bot's sheets.py schema) to our trade shape.
+// Bot headers: Date, Symbol, Mode, Setup, Session, Entry Time, Entry Price,
+//              Exit Time, Exit Price, Qty, Cost, P&L, Pct, Reason, RSI, ATR, BE, Result
+function rowToTrade(row, idx) {
+  const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
+  const get = (...keys) => {
+    for (const k of keys) {
+      const nk = norm(k);
+      const match = Object.keys(row).find(rk => norm(rk) === nk);
+      if (match && row[match] != null && row[match] !== "") return row[match];
+    }
+    return "";
+  };
+  const num = (v) => {
+    const n = parseFloat(String(v).replace(/[$,]/g, ""));
+    return Number.isFinite(n) ? n : 0;
+  };
+  const entryTime = get("entry_time", "entrytime", "time");
+  return {
+    id: idx,
+    date: String(get("date")).slice(0, 10),
+    time: String(entryTime).slice(0, 5) || "00:00",
+    ticker: String(get("symbol", "ticker")).trim(),
+    mode: String(get("mode", "strategy")).trim() || "—",
+    setup: String(get("setup")).trim() || "—",
+    entry: num(get("entry_price", "entry")),
+    exit:  num(get("exit_price", "exit")),
+    qty:   num(get("qty", "quantity")),
+    pnl:   num(get("pnl", "p&l", "pl")),
+    reason: String(get("reason")).trim(),
+  };
+}
+
+function csvToTrades(text) {
+  const rows = parseCSV(text).filter(r => r.some(c => c && c.trim() !== ""));
+  if (rows.length < 2) return [];
+  const headers = rows[0].map(h => h.trim());
+  return rows.slice(1).map((r, i) => {
+    const obj = {};
+    headers.forEach((h, j) => { obj[h] = r[j] != null ? r[j].trim() : ""; });
+    return rowToTrade(obj, i + 1);
+  }).filter(t => t.date && t.ticker);
+}
+
+function toSheetsCsvUrl(url) {
+  const u = url.trim();
+  // Case 1: already a published CSV (File → Publish to web → CSV). Pass through.
+  //   e.g. https://docs.google.com/spreadsheets/d/e/2PACX-.../pub?gid=...&output=csv
+  if (/\/spreadsheets\/d\/e\//.test(u) || /output=csv/.test(u)) {
+    // If user pasted the HTML publish URL without output=csv, tack it on
+    if (!/output=csv/.test(u)) {
+      return u + (u.includes("?") ? "&" : "?") + "output=csv";
+    }
+    return u;
+  }
+  // Case 2: edit URL → rewrite to /export. Note: this path is CORS-restricted
+  // from file:// — you'll need localhost or to use a published URL instead.
+  const m = u.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  if (!m) return u;
+  const id = m[1];
+  const gidMatch = u.match(/[?&#]gid=(\d+)/);
+  const gid = gidMatch ? gidMatch[1] : "0";
+  return `https://docs.google.com/spreadsheets/d/${id}/export?format=csv&gid=${gid}`;
+}
+
+// ─── Theme ──────────────────────────────────────────────────────────────────
+const T = {
+  bg: "#070b12",
+  panel: "#0d1320",
+  panelHi: "#111827",
+  border: "#1a2332",
+  borderHi: "#253040",
+  text: "#e4e9f0",
+  textMid: "#94a3b8",
+  textDim: "#64748b",
+  textFaint: "#475569",
+  green: "#10b981",
+  red: "#ef4444",
+  blue: "#3b82f6",
+  blueLi: "#60a5fa",
+  amber: "#f59e0b",
+};
+
+const TICKER_COLORS = {
+  SOXL: "#60a5fa", SOXS: "#f472b6", TQQQ: "#34d399", SQQQ: "#fb923c",
+  "ETH/USD": "#a78bfa", "DOGE/USD": "#fbbf24", "SOL/USD": "#22d3ee",
+};
+const tickerColor = (t) => TICKER_COLORS[t] || "#94a3b8";
+
+const MODE_COLORS = {
+  "Strategy D": "#60a5fa",
+  "ETH":        "#a78bfa",
+  "ORB":        "#34d399",
+  "HA Scalper": "#fbbf24",
+};
+const modeColor = (m) => MODE_COLORS[m] || "#94a3b8";
+
+function Dashboard() {
+  const [trades, setTrades] = useState(DEFAULT_TRADES);
+  const [dataSource, setDataSource] = useState("sample"); // sample | csv | sheets
+  const [tickerFilter, setTickerFilter] = useState("ALL");
+  const [strategyFilter, setStrategyFilter] = useState("ALL");
+  const [sheetsUrl, setSheetsUrl] = useState("");
+  const [linkedUrl, setLinkedUrl] = useState(""); // URL currently linked for refresh
+  const [loadMsg, setLoadMsg] = useState("");
+  const [loadState, setLoadState] = useState("idle"); // idle | loading | ok | error
+  const [search, setSearch] = useState("");
+  const [showImport, setShowImport] = useState(false);
+  const [lastRefresh, setLastRefresh] = useState(null);
+  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [nowTick, setNowTick] = useState(Date.now()); // for "updated Xs ago"
+  const fileRef = useRef(null);
+
+  // Restore linked URL from localStorage
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(LS_URL);
+      if (saved) { setSheetsUrl(saved); setLinkedUrl(saved); }
+    } catch (e) { /* no localStorage in this context */ }
+  }, []);
+
+  // "Updated X ago" ticker — 1 Hz while we have a refresh timestamp
+  useEffect(() => {
+    if (!lastRefresh) return;
+    const id = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [lastRefresh]);
+
+  const { allTickers, allStrategies } = useMemo(() => {
+    const t = new Set(), s = new Set();
+    trades.forEach(tr => { if (tr.ticker) t.add(tr.ticker); if (tr.mode) s.add(tr.mode); });
+    return { allTickers: [...t].sort(), allStrategies: [...s].sort() };
+  }, [trades]);
+
+  const filtered = useMemo(() => {
+    return trades.filter(t => {
+      if (tickerFilter !== "ALL" && t.ticker !== tickerFilter) return false;
+      if (strategyFilter !== "ALL" && t.mode !== strategyFilter) return false;
+      if (search && !(`${t.ticker} ${t.setup} ${t.reason} ${t.mode}`.toLowerCase().includes(search.toLowerCase()))) return false;
+      return true;
+    });
+  }, [trades, tickerFilter, strategyFilter, search]);
+
+  const sortedAsc = useMemo(
+    () => [...filtered].sort((a, b) => `${a.date} ${a.time}`.localeCompare(`${b.date} ${b.time}`)),
+    [filtered]
+  );
+
+  const stats = useMemo(() => {
+    const total = filtered.reduce((s, t) => s + t.pnl, 0);
+    const wins = filtered.filter(t => t.pnl > 0);
+    const losses = filtered.filter(t => t.pnl <= 0);
+    const winRate = filtered.length ? (wins.length / filtered.length * 100) : 0;
+    const grossW = wins.reduce((s, t) => s + t.pnl, 0);
+    const grossL = Math.abs(losses.reduce((s, t) => s + t.pnl, 0));
+    const pf = grossL > 0 ? (grossW / grossL) : (grossW > 0 ? Infinity : 0);
+    const avgW = wins.length ? grossW / wins.length : 0;
+    const avgL = losses.length ? grossL / losses.length : 0;
+    const expectancy = filtered.length ? total / filtered.length : 0;
+    const best = filtered.length ? Math.max(...filtered.map(t => t.pnl)) : 0;
+    const worst = filtered.length ? Math.min(...filtered.map(t => t.pnl)) : 0;
+
+    let running = 0, peak = 0, maxDD = 0;
+    const equity = sortedAsc.map((t, i) => {
+      running += t.pnl;
+      peak = Math.max(peak, running);
+      const dd = running - peak;
+      maxDD = Math.min(maxDD, dd);
+      return { i: i + 1, eq: +running.toFixed(2), dd: +dd.toFixed(2), date: t.date };
+    });
+
+    let curStreak = 0, curType = null, bestW = 0, worstL = 0;
+    sortedAsc.forEach(t => {
+      const type = t.pnl > 0 ? "W" : "L";
+      if (type === curType) curStreak++;
+      else { curType = type; curStreak = 1; }
+      if (type === "W") bestW = Math.max(bestW, curStreak);
+      else worstL = Math.max(worstL, curStreak);
+    });
+
+    return { total, wins: wins.length, losses: losses.length, winRate, pf, avgW, avgL, expectancy, best, worst, equity, maxDD, curStreak, curType, bestW, worstL };
+  }, [filtered, sortedAsc]);
+
+  const dailyPnl = useMemo(() => {
+    const m = {};
+    filtered.forEach(t => { m[t.date] = (m[t.date] || 0) + t.pnl; });
+    return Object.entries(m).sort().map(([d, p]) => ({ date: d.slice(5), pnl: +p.toFixed(2) }));
+  }, [filtered]);
+
+  const hourlyPnl = useMemo(() => {
+    const m = {};
+    filtered.forEach(t => {
+      const h = parseInt((t.time || "00:00").slice(0, 2), 10);
+      if (!Number.isFinite(h)) return;
+      if (!m[h]) m[h] = { hour: h, pnl: 0, trades: 0 };
+      m[h].pnl += t.pnl; m[h].trades++;
+    });
+    return Object.values(m).sort((a, b) => a.hour - b.hour).map(r => ({
+      ...r, pnl: +r.pnl.toFixed(2),
+      label: `${String(r.hour).padStart(2, "0")}:00`
+    }));
+  }, [filtered]);
+
+  const groupBy = (keyFn) => {
+    const m = {};
+    filtered.forEach(t => {
+      const k = keyFn(t);
+      if (!m[k]) m[k] = { key: k, trades: 0, pnl: 0, wins: 0 };
+      m[k].trades++; m[k].pnl += t.pnl; if (t.pnl > 0) m[k].wins++;
+    });
+    return Object.values(m).map(r => ({ ...r, pnl: +r.pnl.toFixed(2), wr: r.trades ? (r.wins / r.trades * 100) : 0 }));
+  };
+  const byTicker   = useMemo(() => groupBy(t => t.ticker).sort((a, b) => b.pnl - a.pnl), [filtered]);
+  const byStrategy = useMemo(() => groupBy(t => t.mode).sort((a, b) => b.pnl - a.pnl), [filtered]);
+  const byReason   = useMemo(() => groupBy(t => t.reason || "—").sort((a, b) => b.trades - a.trades), [filtered]);
+
+  const mostRecentDate = useMemo(() => {
+    if (!trades.length) return "";
+    return [...trades].map(t => t.date).sort().reverse()[0];
+  }, [trades]);
+  const todayTrades = filtered.filter(t => t.date === mostRecentDate);
+  const todayPnl = todayTrades.reduce((s, t) => s + t.pnl, 0);
+  const todayWins = todayTrades.filter(t => t.pnl > 0).length;
+
+  // ─── Import handlers ────────────────────────────────────────────────────
+  const loadCsvText = (text) => {
+    try {
+      const parsed = csvToTrades(text);
+      if (!parsed.length) { setLoadState("error"); setLoadMsg("No valid trades found in CSV."); return false; }
+      setTrades(parsed);
+      setLoadState("ok");
+      setLoadMsg(`Loaded ${parsed.length} trades.`);
+      setLastRefresh(Date.now());
+      return true;
+    } catch (e) {
+      setLoadState("error"); setLoadMsg(`Parse failed: ${e.message}`);
+      return false;
+    }
+  };
+
+  const onFile = (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => {
+      if (loadCsvText(String(r.result || ""))) {
+        setDataSource("csv");
+        setLinkedUrl(""); // file import clears sheet link
+        setTimeout(() => setShowImport(false), 600);
+      }
+    };
+    r.onerror = () => { setLoadState("error"); setLoadMsg("File read failed."); };
+    r.readAsText(f);
+  };
+
+  // Core fetch — used by both "Link Sheet" and the refresh button
+  const fetchFromSheets = useCallback(async (url, { silent = false } = {}) => {
+    if (!url) return false;
+    if (!silent) { setLoadState("loading"); setLoadMsg("Fetching…"); }
+    try {
+      const csvUrl = toSheetsCsvUrl(url.trim());
+      // cache-bust so refresh always pulls fresh
+      const busted = csvUrl + (csvUrl.includes("?") ? "&" : "?") + "_t=" + Date.now();
+      const res = await fetch(busted, { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      if (text.includes("<!DOCTYPE html>") || text.includes("<html")) {
+        throw new Error("Got HTML instead of CSV. The sheet isn't public, or you used an /edit URL that returned a login page. Use File → Publish to web → CSV.");
+      }
+      const ok = loadCsvText(text);
+      if (ok) setDataSource("sheets");
+      return ok;
+    } catch (e) {
+      setLoadState("error");
+      // fetch() throws TypeError on CORS / network failure — give a useful tip
+      const isNetErr = e instanceof TypeError || /Failed to fetch|NetworkError|CORS/i.test(e.message || "");
+      const openedFromFile = typeof window !== "undefined" && window.location.protocol === "file:";
+      if (isNetErr) {
+        if (openedFromFile) {
+          setLoadMsg("Network error — browsers block fetch() from file:// URLs. Either (1) File → Publish to web → CSV in Sheets and paste that URL, or (2) serve this file from localhost: run `python3 -m http.server 8000` in the folder, then open http://localhost:8000/dashboard.html");
+        } else {
+          setLoadMsg("Network error — the sheet isn't reachable. Use File → Share → Publish to web → CSV, and paste the /pub?...output=csv URL here.");
+        }
+      } else {
+        setLoadMsg(e.message);
+      }
+      return false;
+    }
+  }, []);
+
+  const linkSheet = async () => {
+    if (!sheetsUrl.trim()) return;
+    const ok = await fetchFromSheets(sheetsUrl);
+    if (ok) {
+      setLinkedUrl(sheetsUrl.trim());
+      try { localStorage.setItem(LS_URL, sheetsUrl.trim()); } catch (e) {}
+      setTimeout(() => setShowImport(false), 600);
+    }
+  };
+
+  const refresh = async () => {
+    if (!linkedUrl) { setShowImport(true); return; }
+    await fetchFromSheets(linkedUrl);
+  };
+
+  const unlink = () => {
+    setLinkedUrl(""); setSheetsUrl(""); setAutoRefresh(false);
+    try { localStorage.removeItem(LS_URL); } catch (e) {}
+  };
+
+  // Auto-refresh timer
+  useEffect(() => {
+    if (!autoRefresh || !linkedUrl) return;
+    const id = setInterval(() => { fetchFromSheets(linkedUrl, { silent: true }); }, 60_000);
+    return () => clearInterval(id);
+  }, [autoRefresh, linkedUrl, fetchFromSheets]);
+
+  const resetToSample = () => {
+    setTrades(DEFAULT_TRADES); setDataSource("sample");
+    setLoadState("idle"); setLoadMsg(""); setLastRefresh(null);
+    setTickerFilter("ALL"); setStrategyFilter("ALL"); setSearch("");
+  };
+
+  // ─── Small pieces ───────────────────────────────────────────────────────
+  const PnlText = ({ value, bold = false, size }) => (
+    <span style={{
+      color: value > 0 ? T.green : value < 0 ? T.red : T.textMid,
+      fontWeight: bold ? 700 : 500, fontSize: size,
+      fontVariantNumeric: "tabular-nums",
+    }}>
+      {value > 0 ? "+" : value < 0 ? "−" : ""}${Math.abs(value).toFixed(2)}
+    </span>
+  );
+
+  const Chip = ({ active, onClick, color, children, count }) => (
+    <button onClick={onClick} style={{
+      padding: "6px 12px", fontSize: "10.5px", borderRadius: "6px",
+      border: active ? `1px solid ${color || T.blue}` : `1px solid ${T.border}`,
+      background: active ? `${color || T.blue}22` : T.panel,
+      color: active ? (color || T.blueLi) : T.textMid,
+      cursor: "pointer", letterSpacing: "1px",
+      fontWeight: active ? 600 : 500,
+      transition: "all 120ms ease",
+      display: "inline-flex", alignItems: "center", gap: "6px",
+    }}>
+      {active && <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: color || T.blue }} />}
+      {children}
+      {count != null && <span style={{ color: T.textFaint, fontSize: "9px" }}>{count}</span>}
+    </button>
+  );
+
+  const Panel = ({ title, right, children, style }) => (
+    <div style={{
+      background: T.panelHi, border: `1px solid ${T.border}`, borderRadius: "10px",
+      padding: "16px", ...style,
+    }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "12px", gap: "12px" }}>
+        <div style={{ fontSize: "9.5px", letterSpacing: "2.5px", color: T.textDim, fontWeight: 600 }}>{title}</div>
+        {right}
+      </div>
+      {children}
+    </div>
+  );
+
+  const tooltipStyle = {
+    background: "#0f172aee", border: `1px solid ${T.borderHi}`,
+    borderRadius: "6px", fontSize: "11px", color: T.text,
+  };
+
+  // "X seconds ago" formatter
+  const ago = (ts) => {
+    const s = Math.floor((nowTick - ts) / 1000);
+    if (s < 5) return "just now";
+    if (s < 60) return `${s}s ago`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    return `${h}h ${m % 60}m ago`;
+  };
+
+  const statusLabel = dataSource === "sample" ? "SAMPLE DATA" : dataSource === "csv" ? "CSV IMPORT" : "GOOGLE SHEETS";
+  const statusColor = dataSource === "sample" ? T.amber : T.green;
+
+  return (
+    <div style={{ background: T.bg, color: T.text, minHeight: "100vh" }}>
+      {/* Header */}
+      <div style={{
+        background: "linear-gradient(135deg, #0b1220 0%, #141f3a 100%)",
+        borderBottom: `1px solid ${T.border}`, padding: "18px 24px",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "16px" }}>
+          <div>
+            <div style={{ fontSize: "10px", letterSpacing: "3px", color: T.textDim, marginBottom: "4px" }}>
+              ALPHA HUNTER <span style={{ color: T.textFaint }}>/ v3.1</span>
+            </div>
+            <div style={{ fontSize: "22px", fontWeight: 700, color: "#f1f5f9", letterSpacing: "-0.3px" }}>
+              Trading Dashboard
+            </div>
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+            {/* Status pill */}
+            <div style={{
+              padding: "5px 10px", fontSize: "9.5px", letterSpacing: "1.5px",
+              border: `1px solid ${T.border}`, borderRadius: "6px", color: T.textMid,
+              display: "inline-flex", alignItems: "center", gap: "6px",
+            }}>
+              <span className={loadState === "loading" ? "" : "pulse"} style={{
+                width: "6px", height: "6px", borderRadius: "50%",
+                background: statusColor, boxShadow: `0 0 8px ${statusColor}`,
+              }} />
+              {statusLabel}
+              <span style={{ color: T.textFaint }}>· {trades.length} trades</span>
+              {lastRefresh && dataSource === "sheets" && (
+                <span style={{ color: T.textFaint }}>· {ago(lastRefresh)}</span>
+              )}
+            </div>
+
+            {/* Refresh (only when linked) */}
+            {linkedUrl && (
+              <button
+                onClick={refresh}
+                disabled={loadState === "loading"}
+                title="Reload trades from the linked Google Sheet"
+                style={{
+                  padding: "6px 12px", fontSize: "10.5px",
+                  border: `1px solid ${T.green}55`,
+                  background: `${T.green}18`, color: T.green, borderRadius: "6px",
+                  cursor: loadState === "loading" ? "wait" : "pointer",
+                  letterSpacing: "1px", fontWeight: 600,
+                  display: "inline-flex", alignItems: "center", gap: "6px",
+                }}
+              >
+                <span className={loadState === "loading" ? "spin" : ""} style={{ display: "inline-block" }}>↻</span>
+                REFRESH
+              </button>
+            )}
+
+            {/* Auto-refresh toggle */}
+            {linkedUrl && (
+              <button
+                onClick={() => setAutoRefresh(v => !v)}
+                title="Auto-refresh every 60 seconds"
+                style={{
+                  padding: "6px 10px", fontSize: "10px",
+                  border: `1px solid ${autoRefresh ? T.green : T.border}`,
+                  background: autoRefresh ? `${T.green}15` : "transparent",
+                  color: autoRefresh ? T.green : T.textMid,
+                  borderRadius: "6px", cursor: "pointer", letterSpacing: "1px",
+                }}
+              >
+                AUTO {autoRefresh ? "ON" : "OFF"}
+              </button>
+            )}
+
+            <button onClick={() => setShowImport(s => !s)} style={{
+              padding: "6px 12px", fontSize: "10.5px", border: `1px solid ${T.borderHi}`,
+              background: showImport ? T.borderHi : T.panel, color: T.text, borderRadius: "6px",
+              cursor: "pointer", letterSpacing: "1px", fontWeight: 600,
+            }}>
+              {showImport ? "CLOSE" : (linkedUrl ? "SETTINGS" : "IMPORT DATA")}
+            </button>
+
+            {dataSource !== "sample" && (
+              <button onClick={resetToSample} style={{
+                padding: "6px 10px", fontSize: "10px", border: `1px solid ${T.border}`,
+                background: "transparent", color: T.textMid, borderRadius: "6px", cursor: "pointer",
+              }}>RESET</button>
+            )}
+          </div>
+        </div>
+
+        {/* Import drawer */}
+        {showImport && (
+          <div style={{
+            marginTop: "14px", padding: "14px", background: "#080d18",
+            border: `1px solid ${T.border}`, borderRadius: "8px",
+          }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
+              {/* CSV */}
+              <div>
+                <div style={{ fontSize: "9.5px", letterSpacing: "2px", color: T.textDim, marginBottom: "8px" }}>
+                  CSV FILE (ONE-TIME IMPORT)
+                </div>
+                <input ref={fileRef} type="file" accept=".csv,text/csv" onChange={onFile} style={{ display: "none" }} />
+                <button onClick={() => fileRef.current?.click()} style={{
+                  width: "100%", padding: "10px", fontSize: "11px",
+                  border: `1px dashed ${T.borderHi}`, background: "transparent",
+                  color: T.text, borderRadius: "6px", cursor: "pointer", letterSpacing: "1px",
+                }}>
+                  ↑ Choose CSV file
+                </button>
+                <div style={{ fontSize: "9.5px", color: T.textFaint, marginTop: "6px", lineHeight: 1.5 }}>
+                  Expects the bot's <code style={{ color: T.textMid }}>sheets.py</code> schema. Headers matched case-insensitively.
+                </div>
+              </div>
+
+              {/* Google Sheets */}
+              <div>
+                <div style={{ fontSize: "9.5px", letterSpacing: "2px", color: T.textDim, marginBottom: "8px" }}>
+                  GOOGLE SHEETS {linkedUrl && <span style={{ color: T.green }}>· LINKED</span>}
+                </div>
+                <div style={{ display: "flex", gap: "6px" }}>
+                  <input
+                    type="text" value={sheetsUrl}
+                    onChange={e => setSheetsUrl(e.target.value)}
+                    placeholder="Paste the Publish to web CSV URL (…/pub?…&output=csv)"
+                    style={{
+                      flex: 1, padding: "8px 10px", fontSize: "10.5px",
+                      border: `1px solid ${T.border}`, background: T.bg,
+                      color: T.text, borderRadius: "6px", outline: "none",
+                    }}
+                  />
+                  <button onClick={linkSheet} disabled={loadState === "loading"} style={{
+                    padding: "8px 14px", fontSize: "10.5px", border: `1px solid ${T.blue}`,
+                    background: `${T.blue}22`, color: T.blueLi, borderRadius: "6px",
+                    cursor: loadState === "loading" ? "wait" : "pointer",
+                    letterSpacing: "1px", fontWeight: 600,
+                  }}>
+                    {loadState === "loading" ? "…" : (linkedUrl ? "RELINK" : "LINK")}
+                  </button>
+                  {linkedUrl && (
+                    <button onClick={unlink} style={{
+                      padding: "8px 12px", fontSize: "10.5px", border: `1px solid ${T.border}`,
+                      background: "transparent", color: T.textMid, borderRadius: "6px", cursor: "pointer",
+                    }}>
+                      UNLINK
+                    </button>
+                  )}
+                </div>
+                <div style={{ fontSize: "9.5px", color: T.textFaint, marginTop: "6px", lineHeight: 1.5 }}>
+                  <strong style={{ color: T.textMid }}>Recommended:</strong> in Sheets, File → Share → <strong style={{ color: T.textMid }}>Publish to web</strong> → select your Trades tab → CSV → Publish, then paste the <code style={{ color: T.textMid }}>/pub?...output=csv</code> URL here. A regular /edit URL will fail from file:// due to browser CORS.
+                  {linkedUrl && " Once linked, use the ↻ REFRESH button to reload."}
+                </div>
+              </div>
+            </div>
+            {loadMsg && (
+              <div style={{
+                marginTop: "10px", padding: "8px 10px", fontSize: "10.5px",
+                color: loadState === "error" ? "#fca5a5" : "#86efac",
+                background: loadState === "error" ? "#3b101033" : "#05251c",
+                border: `1px solid ${loadState === "error" ? "#7f1d1d55" : "#064e3b55"}`,
+                borderRadius: "6px",
+              }}>
+                {loadMsg}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Filter rows */}
+        <div style={{ marginTop: "14px", display: "flex", flexDirection: "column", gap: "8px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+            <div style={{ fontSize: "9px", letterSpacing: "2px", color: T.textFaint, width: "70px" }}>TICKER</div>
+            <Chip active={tickerFilter === "ALL"} onClick={() => setTickerFilter("ALL")} color={T.blueLi} count={trades.length}>ALL</Chip>
+            {allTickers.map(t => (
+              <Chip key={t} active={tickerFilter === t} onClick={() => setTickerFilter(t)} color={tickerColor(t)}
+                count={trades.filter(x => x.ticker === t).length}>{t}</Chip>
+            ))}
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+            <div style={{ fontSize: "9px", letterSpacing: "2px", color: T.textFaint, width: "70px" }}>STRATEGY</div>
+            <Chip active={strategyFilter === "ALL"} onClick={() => setStrategyFilter("ALL")} color={T.blueLi} count={trades.length}>ALL</Chip>
+            {allStrategies.map(s => (
+              <Chip key={s} active={strategyFilter === s} onClick={() => setStrategyFilter(s)} color={modeColor(s)}
+                count={trades.filter(x => x.mode === s).length}>{s.toUpperCase()}</Chip>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Body */}
+      <div style={{ padding: "20px 24px" }}>
+        {/* Hero metrics */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "10px", marginBottom: "16px" }}>
+          {[
+            { label: "TOTAL P&L", value: <PnlText value={+stats.total.toFixed(2)} bold size="20px" />, sub: `${filtered.length} trades` },
+            { label: "LATEST DAY", value: <PnlText value={+todayPnl.toFixed(2)} bold size="20px" />, sub: `${mostRecentDate.slice(5)} · ${todayTrades.length} trades (${todayWins}W)` },
+            { label: "WIN RATE", value: <span style={{ color: stats.winRate >= 50 ? T.green : T.red, fontWeight: 700, fontSize: "20px" }}>{stats.winRate.toFixed(1)}%</span>, sub: `${stats.wins}W / ${stats.losses}L` },
+            { label: "PROFIT FACTOR", value: <span style={{ color: stats.pf >= 1 ? T.green : T.red, fontWeight: 700, fontSize: "20px" }}>{stats.pf === Infinity ? "∞" : stats.pf.toFixed(2)}</span>, sub: `+$${stats.avgW.toFixed(2)} / -$${stats.avgL.toFixed(2)}` },
+            { label: "EXPECTANCY", value: <PnlText value={+stats.expectancy.toFixed(2)} bold size="20px" />, sub: "per trade" },
+            { label: "MAX DRAWDOWN", value: <span style={{ color: T.red, fontWeight: 700, fontSize: "20px", fontVariantNumeric: "tabular-nums" }}>−${Math.abs(stats.maxDD).toFixed(2)}</span>, sub: `best +$${stats.best.toFixed(2)} / worst −$${Math.abs(stats.worst).toFixed(2)}` },
+            { label: "STREAK", value: <span style={{ color: stats.curType === "W" ? T.green : stats.curType === "L" ? T.red : T.textMid, fontWeight: 700, fontSize: "20px" }}>{stats.curStreak || 0}{stats.curType || "-"}</span>, sub: `best ${stats.bestW}W / worst ${stats.worstL}L` },
+          ].map((card, i) => (
+            <div key={i} style={{
+              background: T.panelHi, border: `1px solid ${T.border}`, borderRadius: "10px",
+              padding: "12px 14px",
+            }}>
+              <div style={{ fontSize: "9px", letterSpacing: "2px", color: T.textDim, marginBottom: "8px", fontWeight: 600 }}>
+                {card.label}
+              </div>
+              <div style={{ marginBottom: "3px" }}>{card.value}</div>
+              <div style={{ fontSize: "9.5px", color: T.textFaint }}>{card.sub}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Equity + drawdown */}
+        <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: "10px", marginBottom: "16px" }}>
+          <Panel title="EQUITY CURVE" right={
+            <div style={{ fontSize: "10px", color: T.textDim }}>
+              {stats.equity.length ? `${stats.equity.length} closed trades` : "No data"}
+            </div>
+          }>
+            <ResponsiveContainer width="100%" height={210}>
+              <AreaChart data={stats.equity} margin={{ top: 4, right: 8, left: -6, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="eqGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={stats.total >= 0 ? T.green : T.red} stopOpacity={0.35} />
+                    <stop offset="100%" stopColor={stats.total >= 0 ? T.green : T.red} stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="2 4" stroke={T.border} />
+                <XAxis dataKey="i" tick={{ fill: T.textFaint, fontSize: 10 }} axisLine={{ stroke: T.border }} tickLine={{ stroke: T.border }} />
+                <YAxis tick={{ fill: T.textFaint, fontSize: 10 }} tickFormatter={v => `$${v}`} axisLine={{ stroke: T.border }} tickLine={{ stroke: T.border }} />
+                <Tooltip contentStyle={tooltipStyle}
+                  formatter={(v, k) => [`$${Number(v).toFixed(2)}`, k === "eq" ? "Equity" : "DD"]}
+                  labelFormatter={(i) => `Trade #${i}`} />
+                <ReferenceLine y={0} stroke={T.borderHi} strokeDasharray="2 2" />
+                <Area type="monotone" dataKey="eq" stroke={stats.total >= 0 ? T.green : T.red} fill="url(#eqGrad)" strokeWidth={2} dot={false} />
+              </AreaChart>
+            </ResponsiveContainer>
+          </Panel>
+
+          <Panel title="DRAWDOWN" right={
+            <div style={{ fontSize: "10px", color: T.red, fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>
+              −${Math.abs(stats.maxDD).toFixed(2)}
+            </div>
+          }>
+            <ResponsiveContainer width="100%" height={210}>
+              <AreaChart data={stats.equity} margin={{ top: 4, right: 8, left: -6, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="ddGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={T.red} stopOpacity={0} />
+                    <stop offset="100%" stopColor={T.red} stopOpacity={0.45} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="2 4" stroke={T.border} />
+                <XAxis dataKey="i" tick={{ fill: T.textFaint, fontSize: 10 }} axisLine={{ stroke: T.border }} tickLine={{ stroke: T.border }} />
+                <YAxis tick={{ fill: T.textFaint, fontSize: 10 }} tickFormatter={v => `$${v}`} axisLine={{ stroke: T.border }} tickLine={{ stroke: T.border }} />
+                <Tooltip contentStyle={tooltipStyle} formatter={(v) => [`$${Number(v).toFixed(2)}`, "DD"]} labelFormatter={(i) => `Trade #${i}`} />
+                <Area type="monotone" dataKey="dd" stroke={T.red} fill="url(#ddGrad)" strokeWidth={1.5} dot={false} />
+              </AreaChart>
+            </ResponsiveContainer>
+          </Panel>
+        </div>
+
+        {/* Daily + Hourly */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", marginBottom: "16px" }}>
+          <Panel title="DAILY P&L">
+            <ResponsiveContainer width="100%" height={170}>
+              <BarChart data={dailyPnl} margin={{ top: 4, right: 8, left: -6, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="2 4" stroke={T.border} />
+                <XAxis dataKey="date" tick={{ fill: T.textFaint, fontSize: 10 }} axisLine={{ stroke: T.border }} tickLine={{ stroke: T.border }} />
+                <YAxis tick={{ fill: T.textFaint, fontSize: 10 }} tickFormatter={v => `$${v}`} axisLine={{ stroke: T.border }} tickLine={{ stroke: T.border }} />
+                <Tooltip contentStyle={tooltipStyle} formatter={v => [`$${Number(v).toFixed(2)}`, "P&L"]} />
+                <ReferenceLine y={0} stroke={T.borderHi} />
+                <Bar dataKey="pnl" radius={[3, 3, 0, 0]}>
+                  {dailyPnl.map((d, i) => (<Cell key={i} fill={d.pnl >= 0 ? T.green : T.red} fillOpacity={0.85} />))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </Panel>
+
+          <Panel title="P&L BY HOUR">
+            {hourlyPnl.length ? (
+              <ResponsiveContainer width="100%" height={170}>
+                <BarChart data={hourlyPnl} margin={{ top: 4, right: 8, left: -6, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="2 4" stroke={T.border} />
+                  <XAxis dataKey="label" tick={{ fill: T.textFaint, fontSize: 10 }} axisLine={{ stroke: T.border }} tickLine={{ stroke: T.border }} />
+                  <YAxis tick={{ fill: T.textFaint, fontSize: 10 }} tickFormatter={v => `$${v}`} axisLine={{ stroke: T.border }} tickLine={{ stroke: T.border }} />
+                  <Tooltip contentStyle={tooltipStyle}
+                    formatter={(v, _k, p) => [`$${Number(v).toFixed(2)} · ${p.payload.trades} trades`, "P&L"]} />
+                  <ReferenceLine y={0} stroke={T.borderHi} />
+                  <Bar dataKey="pnl" radius={[3, 3, 0, 0]}>
+                    {hourlyPnl.map((d, i) => (<Cell key={i} fill={d.pnl >= 0 ? T.green : T.red} fillOpacity={0.85} />))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            ) : <div style={{ color: T.textFaint, fontSize: "11px" }}>No data</div>}
+          </Panel>
+        </div>
+
+        {/* Breakdown tables */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "10px", marginBottom: "16px" }}>
+          <Panel title="BY STRATEGY"><BreakdownTable rows={byStrategy} colorFn={modeColor} /></Panel>
+          <Panel title="BY TICKER"><BreakdownTable rows={byTicker} colorFn={tickerColor} /></Panel>
+          <Panel title="BY EXIT REASON"><BreakdownTable rows={byReason} colorFn={() => T.textMid} /></Panel>
+        </div>
+
+        {/* Trade log */}
+        <Panel title={`TRADE LOG · ${filtered.length}`} right={
+          <input
+            value={search} onChange={e => setSearch(e.target.value)}
+            placeholder="filter ticker / setup / reason…"
+            style={{
+              padding: "5px 10px", fontSize: "10.5px",
+              border: `1px solid ${T.border}`, background: T.bg,
+              color: T.text, borderRadius: "6px", outline: "none", width: "260px",
+            }}
+          />
+        }>
+          <div style={{ overflowX: "auto", maxHeight: "420px", overflowY: "auto" }}>
+            <table style={{ width: "100%", fontSize: "11px", borderCollapse: "collapse", fontVariantNumeric: "tabular-nums" }}>
+              <thead style={{ position: "sticky", top: 0, background: T.panelHi, zIndex: 1 }}>
+                <tr style={{ color: T.textDim, borderBottom: `1px solid ${T.border}` }}>
+                  <th style={thStyle}>Date / Time</th>
+                  <th style={thStyle}>Ticker</th>
+                  <th style={thStyle}>Strategy</th>
+                  <th style={thStyle}>Setup</th>
+                  <th style={{ ...thStyle, textAlign: "right" }}>Entry</th>
+                  <th style={{ ...thStyle, textAlign: "right" }}>Exit</th>
+                  <th style={{ ...thStyle, textAlign: "right" }}>Qty</th>
+                  <th style={{ ...thStyle, textAlign: "right" }}>P&amp;L</th>
+                  <th style={thStyle}>Reason</th>
+                  <th style={{ ...thStyle, textAlign: "center" }}>R</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[...filtered].sort((a, b) => `${b.date} ${b.time}`.localeCompare(`${a.date} ${a.time}`)).map(t => (
+                  <tr key={t.id} style={{ borderBottom: "1px solid #0f172a" }}>
+                    <td style={{ ...tdStyle, color: T.textMid }}>{t.date} <span style={{ color: T.textFaint }}>{t.time}</span></td>
+                    <td style={{ ...tdStyle, fontWeight: 600, color: tickerColor(t.ticker) }}>{t.ticker}</td>
+                    <td style={tdStyle}>
+                      <span style={{
+                        background: `${modeColor(t.mode)}18`, color: modeColor(t.mode),
+                        padding: "2px 7px", borderRadius: "4px", fontSize: "9.5px", fontWeight: 600,
+                        letterSpacing: "0.5px",
+                      }}>{t.mode}</span>
+                    </td>
+                    <td style={tdStyle}>
+                      <span style={{ background: T.border, color: T.textMid, padding: "2px 7px", borderRadius: "4px", fontSize: "10px" }}>
+                        {t.setup}
+                      </span>
+                    </td>
+                    <td style={{ ...tdStyle, textAlign: "right" }}>${formatPrice(t.entry)}</td>
+                    <td style={{ ...tdStyle, textAlign: "right" }}>${formatPrice(t.exit)}</td>
+                    <td style={{ ...tdStyle, textAlign: "right", color: T.textMid }}>{formatQty(t.qty)}</td>
+                    <td style={{ ...tdStyle, textAlign: "right" }}><PnlText value={t.pnl} bold /></td>
+                    <td style={{ ...tdStyle, color: T.textDim, fontSize: "10px" }}>{t.reason}</td>
+                    <td style={{ ...tdStyle, textAlign: "center" }}>
+                      {t.pnl > 0
+                        ? <span style={{ color: T.green, fontWeight: 600, fontSize: "10px" }}>W</span>
+                        : <span style={{ color: T.red,   fontWeight: 600, fontSize: "10px" }}>L</span>}
+                    </td>
+                  </tr>
+                ))}
+                {!filtered.length && (
+                  <tr><td colSpan={10} style={{ padding: "40px", textAlign: "center", color: T.textFaint }}>
+                    No trades match the current filters.
+                  </td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
+
+        <div style={{ textAlign: "center", padding: "20px", color: T.textFaint, fontSize: "9.5px", letterSpacing: "1.5px" }}>
+          ALPHA HUNTER v3.1 · STRATEGY D + ETH + ORB + HA SCALPER
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const thStyle = { padding: "8px", textAlign: "left", fontWeight: 500, fontSize: "10px", letterSpacing: "0.5px" };
+const tdStyle = { padding: "7px 8px" };
+
+function formatPrice(n) {
+  if (!Number.isFinite(n)) return "0.00";
+  if (Math.abs(n) >= 1) return n.toFixed(2);
+  return n.toFixed(4);
+}
+function formatQty(n) {
+  if (!Number.isFinite(n)) return "0";
+  if (n >= 1000) return n.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  if (n >= 1)    return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  return n.toFixed(3);
+}
+
+function BreakdownTable({ rows, colorFn }) {
+  if (!rows.length) return <div style={{ color: "#475569", fontSize: "11px", padding: "8px 0" }}>No data</div>;
+  return (
+    <table style={{ width: "100%", fontSize: "11px", borderCollapse: "collapse", fontVariantNumeric: "tabular-nums" }}>
+      <thead>
+        <tr style={{ color: "#64748b", borderBottom: "1px solid #1a2332" }}>
+          <td style={{ padding: "6px 0", textAlign: "left" }}>Name</td>
+          <td style={{ textAlign: "right" }}>N</td>
+          <td style={{ textAlign: "right" }}>P&amp;L</td>
+          <td style={{ textAlign: "right" }}>WR</td>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map(r => (
+          <tr key={r.key} style={{ borderBottom: "1px solid #0f172a" }}>
+            <td style={{ padding: "7px 0", fontWeight: 600, color: colorFn(r.key) }}>{r.key}</td>
+            <td style={{ textAlign: "right", color: "#94a3b8" }}>{r.trades}</td>
+            <td style={{
+              textAlign: "right",
+              color: r.pnl > 0 ? "#10b981" : r.pnl < 0 ? "#ef4444" : "#94a3b8",
+              fontWeight: 600,
+            }}>
+              {r.pnl > 0 ? "+" : r.pnl < 0 ? "−" : ""}${Math.abs(r.pnl).toFixed(2)}
+            </td>
+            <td style={{ textAlign: "right", color: r.wr >= 50 ? "#10b981" : "#ef4444" }}>
+              {r.wr.toFixed(0)}%
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<Dashboard />);
+</script>
+</body>
+</html>
