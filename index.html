@@ -198,7 +198,6 @@ function Dashboard() {
   const [showImport, setShowImport] = useState(false);
   const [lastRefresh, setLastRefresh] = useState(null);
   const [autoRefresh, setAutoRefresh] = useState(false);
-  const [nowTick, setNowTick] = useState(Date.now()); // for "updated Xs ago"
   const fileRef = useRef(null);
 
   // Restore linked URL from localStorage
@@ -208,13 +207,6 @@ function Dashboard() {
       if (saved) { setSheetsUrl(saved); setLinkedUrl(saved); }
     } catch (e) { /* no localStorage in this context */ }
   }, []);
-
-  // "Updated X ago" ticker — 1 Hz while we have a refresh timestamp
-  useEffect(() => {
-    if (!lastRefresh) return;
-    const id = setInterval(() => setNowTick(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [lastRefresh]);
 
   const { allTickers, allStrategies } = useMemo(() => {
     const t = new Set(), s = new Set();
@@ -457,17 +449,6 @@ function Dashboard() {
     borderRadius: "6px", fontSize: "11px", color: T.text,
   };
 
-  // "X seconds ago" formatter
-  const ago = (ts) => {
-    const s = Math.floor((nowTick - ts) / 1000);
-    if (s < 5) return "just now";
-    if (s < 60) return `${s}s ago`;
-    const m = Math.floor(s / 60);
-    if (m < 60) return `${m}m ago`;
-    const h = Math.floor(m / 60);
-    return `${h}h ${m % 60}m ago`;
-  };
-
   const statusLabel = dataSource === "sample" ? "SAMPLE DATA" : dataSource === "csv" ? "CSV IMPORT" : "GOOGLE SHEETS";
   const statusColor = dataSource === "sample" ? T.amber : T.green;
 
@@ -502,7 +483,7 @@ function Dashboard() {
               {statusLabel}
               <span style={{ color: T.textFaint }}>· {trades.length} trades</span>
               {lastRefresh && dataSource === "sheets" && (
-                <span style={{ color: T.textFaint }}>· {ago(lastRefresh)}</span>
+                <span style={{ color: T.textFaint }}>· <TimeAgo ts={lastRefresh} /></span>
               )}
             </div>
 
@@ -707,7 +688,7 @@ function Dashboard() {
                   formatter={(v, k) => [`$${Number(v).toFixed(2)}`, k === "eq" ? "Equity" : "DD"]}
                   labelFormatter={(i) => `Trade #${i}`} />
                 <ReferenceLine y={0} stroke={T.borderHi} strokeDasharray="2 2" />
-                <Area type="monotone" dataKey="eq" stroke={stats.total >= 0 ? T.green : T.red} fill="url(#eqGrad)" strokeWidth={2} dot={false} />
+                <Area type="monotone" dataKey="eq" stroke={stats.total >= 0 ? T.green : T.red} fill="url(#eqGrad)" strokeWidth={2} dot={false} isAnimationActive={false} />
               </AreaChart>
             </ResponsiveContainer>
           </Panel>
@@ -729,7 +710,7 @@ function Dashboard() {
                 <XAxis dataKey="i" tick={{ fill: T.textFaint, fontSize: 10 }} axisLine={{ stroke: T.border }} tickLine={{ stroke: T.border }} />
                 <YAxis tick={{ fill: T.textFaint, fontSize: 10 }} tickFormatter={v => `$${v}`} axisLine={{ stroke: T.border }} tickLine={{ stroke: T.border }} />
                 <Tooltip contentStyle={tooltipStyle} formatter={(v) => [`$${Number(v).toFixed(2)}`, "DD"]} labelFormatter={(i) => `Trade #${i}`} />
-                <Area type="monotone" dataKey="dd" stroke={T.red} fill="url(#ddGrad)" strokeWidth={1.5} dot={false} />
+                <Area type="monotone" dataKey="dd" stroke={T.red} fill="url(#ddGrad)" strokeWidth={1.5} dot={false} isAnimationActive={false} />
               </AreaChart>
             </ResponsiveContainer>
           </Panel>
@@ -745,7 +726,7 @@ function Dashboard() {
                 <YAxis tick={{ fill: T.textFaint, fontSize: 10 }} tickFormatter={v => `$${v}`} axisLine={{ stroke: T.border }} tickLine={{ stroke: T.border }} />
                 <Tooltip contentStyle={tooltipStyle} formatter={v => [`$${Number(v).toFixed(2)}`, "P&L"]} />
                 <ReferenceLine y={0} stroke={T.borderHi} />
-                <Bar dataKey="pnl" radius={[3, 3, 0, 0]}>
+                <Bar dataKey="pnl" radius={[3, 3, 0, 0]} isAnimationActive={false}>
                   {dailyPnl.map((d, i) => (<Cell key={i} fill={d.pnl >= 0 ? T.green : T.red} fillOpacity={0.85} />))}
                 </Bar>
               </BarChart>
@@ -762,7 +743,7 @@ function Dashboard() {
                   <Tooltip contentStyle={tooltipStyle}
                     formatter={(v, _k, p) => [`$${Number(v).toFixed(2)} · ${p.payload.trades} trades`, "P&L"]} />
                   <ReferenceLine y={0} stroke={T.borderHi} />
-                  <Bar dataKey="pnl" radius={[3, 3, 0, 0]}>
+                  <Bar dataKey="pnl" radius={[3, 3, 0, 0]} isAnimationActive={false}>
                     {hourlyPnl.map((d, i) => (<Cell key={i} fill={d.pnl >= 0 ? T.green : T.red} fillOpacity={0.85} />))}
                   </Bar>
                 </BarChart>
@@ -866,6 +847,26 @@ function formatQty(n) {
   if (n >= 1000) return n.toLocaleString(undefined, { maximumFractionDigits: 0 });
   if (n >= 1)    return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
   return n.toFixed(3);
+}
+
+// Self-contained: only this component re-renders each second, not the whole dashboard.
+// This keeps Recharts from replaying its entry animation 60 times per minute.
+function TimeAgo({ ts }) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick(t => t + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const s = Math.floor((Date.now() - ts) / 1000);
+  let text;
+  if (s < 5) text = "just now";
+  else if (s < 60) text = `${s}s ago`;
+  else {
+    const m = Math.floor(s / 60);
+    if (m < 60) text = `${m}m ago`;
+    else text = `${Math.floor(m / 60)}h ${m % 60}m ago`;
+  }
+  return <span>{text}</span>;
 }
 
 function BreakdownTable({ rows, colorFn }) {
