@@ -125,15 +125,24 @@ function normalizeTime(raw) {
   const s = String(raw).trim();
 
   // ISO datetime: 2026-04-21T14:31:00(.fff)?(Z|+HH:MM|-HH:MM). Convert UTC → ET.
-  // (If no TZ is present, assume it's already local ET and just extract the time.)
   // The fractional-seconds group is needed because Python's datetime.isoformat()
   // produces strings like "2026-04-21T14:50:08.562711+00:00".
-  const isoDt = s.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?/);
+  //
+  // If the timezone suffix is missing, we assume UTC. The bot's crypto trades
+  // (ETH/DOGE/SOL) log entry_time as `datetime.now(timezone.utc).isoformat()`,
+  // which Google Sheets can silently strip of its timezone suffix when re-exporting
+  // the cell as CSV. Without this assumption, those ISO times display as ET and end
+  // up 4-5 hours ahead of reality (future-dated trades on the chart).
+  //
+  // Note: bare HH:MM / HH:MM:SS times (the bot's equity trades) are handled further
+  // below and ARE treated as ET, which is correct.
+  const isoDt = s.match(/^(\d{4}-\d{2}-\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?/);
   if (isoDt) {
     const [, , hh, mm, ss = "00", tz] = isoDt;
-    if (!tz) return ss && ss !== "00" ? `${hh}:${mm}:${ss}` : `${hh}:${mm}`;
-    // Has a timezone — let Date do the math and format in ET
-    const parsed = Date.parse(s);
+    // Build a canonical form with an explicit timezone so Date.parse is deterministic
+    const tzSuffix = tz || "Z"; // default to UTC when missing
+    const canonical = `${s.slice(0, 10)}T${hh}:${mm}:${ss}${tzSuffix}`;
+    const parsed = Date.parse(canonical);
     if (Number.isNaN(parsed)) return `${hh}:${mm}`;
     const dt = new Date(parsed);
     // Intl gives us HH:MM:SS in ET regardless of where the browser is
