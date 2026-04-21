@@ -116,11 +116,35 @@ function normalizeDate(raw) {
   return s.slice(0, 10);
 }
 
-// Normalize a time string to HH:MM[:SS] (24-hour). Seconds preserved when present.
-// Handles: 09:31, 9:31, 09:31:00, 9:31 AM, 14:31, 14:31:22
+// Normalize a time string to HH:MM[:SS] (24-hour, ET). Seconds preserved when present.
+// Handles: 09:31, 9:31, 09:31:00, 9:31 AM, 14:31, 14:31:22,
+// and ISO datetimes from the bot's ETH logging (2026-04-21T14:31:00+00:00).
+// ISO datetimes with a UTC offset are converted to America/New_York time.
 function normalizeTime(raw) {
   if (!raw) return "00:00";
   const s = String(raw).trim();
+
+  // ISO datetime: 2026-04-21T14:31:00(Z|+HH:MM|-HH:MM). Convert UTC → ET.
+  // (If no TZ is present, assume it's already local ET and just extract the time.)
+  const isoDt = s.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?(Z|[+-]\d{2}:?\d{2})?/);
+  if (isoDt) {
+    const [, , hh, mm, ss = "00", tz] = isoDt;
+    if (!tz) return ss && ss !== "00" ? `${hh}:${mm}:${ss}` : `${hh}:${mm}`;
+    // Has a timezone — let Date do the math and format in ET
+    const parsed = Date.parse(s);
+    if (Number.isNaN(parsed)) return `${hh}:${mm}`;
+    const dt = new Date(parsed);
+    // Intl gives us HH:MM:SS in ET regardless of where the browser is
+    const et = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+    }).format(dt);
+    // en-US 24-hour with hour12:false sometimes returns "24:MM:SS" at midnight — normalize
+    const [h24, m, sec] = et.split(":");
+    const hh2 = h24 === "24" ? "00" : h24;
+    return sec && sec !== "00" ? `${hh2}:${m}:${sec}` : `${hh2}:${m}`;
+  }
+
   // 24-hour with optional seconds
   const m24 = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
   if (m24) {
@@ -137,7 +161,7 @@ function normalizeTime(raw) {
     const base = `${String(h).padStart(2, "0")}:${m12[2]}`;
     return m12[3] ? `${base}:${m12[3]}` : base;
   }
-  return s.slice(0, 5);
+  return "00:00"; // Unrecognized — fail safely to midnight instead of junk string
 }
 
 function rowToTrade(row, idx) {
@@ -156,33 +180,60 @@ function rowToTrade(row, idx) {
   };
   const dateStr = normalizeDate(get("date"));
   const timeStr = normalizeTime(get("entry_time", "entrytime", "time"));
+
+  // IMPORTANT: the bot's sheet has TWO columns that normalize to "pl":
+  //   "P&L $" → normalizes to "pl"
+  //   "P&L %" → normalizes to "pl"
+  // We must target them explicitly by full normalized key to pick the DOLLAR column.
+  // "P&L $" → "pl",  "P&L %" → "pl" (same!), so we walk headers and pick the one whose
+  // raw header ends with $ (or simply contains "$"), falling back to the first "pl".
+  const pickPnl = () => {
+    const keys = Object.keys(row);
+    // Prefer any header containing "$" that normalizes near "pl"
+    const dollarKey = keys.find(k => /p.?l.*\$|pnl.*\$|\$.*p.?l/i.test(k));
+    if (dollarKey && row[dollarKey] !== "") return row[dollarKey];
+    // Next: exact "pnl" header
+    const pnlKey = keys.find(k => norm(k) === "pnl");
+    if (pnlKey && row[pnlKey] !== "") return row[pnlKey];
+    // Last resort: first header that normalizes to "pl" (but beware: could be P&L %)
+    const plKey = keys.find(k => norm(k) === "pl" && !/%/.test(k));
+    if (plKey && row[plKey] !== "") return row[plKey];
+    return "";
+  };
+
   return {
     id: idx,
     date: dateStr,
     time: timeStr,
-    // Sortable: a single timestamp in ms since epoch. Used throughout for sorting/filtering.
     // timeStr may be HH:MM or HH:MM:SS — ISO parser needs seconds, so append :00 if missing.
     ts: Date.parse(`${dateStr}T${timeStr.length === 5 ? timeStr + ":00" : timeStr}`) || 0,
     ticker: String(get("symbol", "ticker")).trim(),
     mode: String(get("mode", "strategy")).trim() || "—",
     setup: String(get("setup")).trim() || "—",
-    entry: num(get("entry_price", "entry")),
-    exit:  num(get("exit_price", "exit")),
+    entry: num(get("entry_price", "entry$", "entry")),
+    exit:  num(get("exit_price", "exit$", "exit")),
     qty:   num(get("qty", "quantity")),
-    pnl:   num(get("pnl", "p&l", "pl")),
+    pnl:   num(pickPnl()),
     reason: String(get("reason")).trim(),
   };
 }
 
 function csvToTrades(text) {
   const rows = parseCSV(text).filter(r => r.some(c => c && c.trim() !== ""));
-  if (rows.length < 2) return [];
+  if (rows.length < 2) return { trades: [], skipped: 0 };
   const headers = rows[0].map(h => h.trim());
-  return rows.slice(1).map((r, i) => {
+  let skipped = 0;
+  const trades = [];
+  rows.slice(1).forEach((r, i) => {
     const obj = {};
     headers.forEach((h, j) => { obj[h] = r[j] != null ? r[j].trim() : ""; });
-    return rowToTrade(obj, i + 1);
-  }).filter(t => t.date && t.ticker);
+    const t = rowToTrade(obj, i + 1);
+    // Minimum required: a date and a ticker. Other fields may be empty for
+    // in-progress trades or sheet formatting quirks — we keep them.
+    if (t.date && t.ticker) trades.push(t);
+    else skipped++;
+  });
+  return { trades, skipped };
 }
 
 function toSheetsCsvUrl(url) {
@@ -409,7 +460,10 @@ function Dashboard() {
   const timeScatter = useMemo(() => {
     return filtered.map(t => {
       const [hh, mm, ss = "0"] = (t.time || "00:00").split(":");
-      const hourOfDay = (parseInt(hh, 10) || 0) + (parseInt(mm, 10) || 0) / 60 + (parseInt(ss, 10) || 0) / 3600;
+      let hourOfDay = (parseInt(hh, 10) || 0) + (parseInt(mm, 10) || 0) / 60 + (parseInt(ss, 10) || 0) / 3600;
+      // Defensive: if time parsing somehow produced a nonsense value, clamp to [0, 24)
+      // so one malformed row can't destroy the axis for everyone else.
+      if (!Number.isFinite(hourOfDay) || hourOfDay < 0 || hourOfDay >= 24) hourOfDay = 0;
       const cost = (t.entry || 0) * (t.qty || 0);
       const pct = cost > 0 ? (t.pnl / cost) * 100 : 0;
       // Categorize: amber for break-even, green/red for winners/losers
@@ -472,11 +526,13 @@ function Dashboard() {
   // ─── Import handlers ────────────────────────────────────────────────────
   const loadCsvText = (text) => {
     try {
-      const parsed = csvToTrades(text);
+      const { trades: parsed, skipped } = csvToTrades(text);
       if (!parsed.length) { setLoadState("error"); setLoadMsg("No valid trades found in CSV."); return false; }
       setTrades(parsed);
       setLoadState("ok");
-      setLoadMsg(`Loaded ${parsed.length} trades.`);
+      setLoadMsg(skipped > 0
+        ? `Loaded ${parsed.length} trades. Skipped ${skipped} row${skipped === 1 ? "" : "s"} with missing date/ticker.`
+        : `Loaded ${parsed.length} trades.`);
       setLastRefresh(Date.now());
       return true;
     } catch (e) {
