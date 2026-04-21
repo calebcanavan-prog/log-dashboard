@@ -62,7 +62,7 @@ const DEFAULT_TRADES = [
   { id: 17, date: "2026-04-15", time: "13:52", ticker: "SOXL",     mode: "Strategy D", setup: "EMA5",  entry: 81.88,   exit: 85.69,   qty: 12,   pnl: 45.72,  reason: "eod_close" },
   { id: 18, date: "2026-04-15", time: "14:46", ticker: "SOXS",     mode: "Strategy D", setup: "EMA20", entry: 21.96,   exit: 21.90,   qty: 45,   pnl: -2.70,  reason: "stop_loss" },
   { id: 19, date: "2026-04-15", time: "15:01", ticker: "SOXS",     mode: "Strategy D", setup: "EMA20", entry: 21.99,   exit: 21.69,   qty: 45,   pnl: -13.50, reason: "stop_loss" },
-];
+].map(t => ({ ...t, ts: Date.parse(`${t.date}T${t.time}:00`) || 0 }));
 
 const LS_URL = "alpha_hunter_sheets_url";
 
@@ -91,6 +91,50 @@ function parseCSV(text) {
 // Map a row object (from bot's sheets.py schema) to our trade shape.
 // Bot headers: Date, Symbol, Mode, Setup, Session, Entry Time, Entry Price,
 //              Exit Time, Exit Price, Qty, Cost, P&L, Pct, Reason, RSI, ATR, BE, Result
+// Normalize a date string of many possible formats to YYYY-MM-DD.
+// Handles: 2026-04-16, 4/16/2026, 04/16/26, Apr 16 2026, 2026-04-16T09:31:00Z, etc.
+function normalizeDate(raw) {
+  if (!raw) return "";
+  const s = String(raw).trim();
+  // Already ISO-ish (YYYY-MM-DD…)
+  const iso = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (iso) return `${iso[1]}-${iso[2].padStart(2, "0")}-${iso[3].padStart(2, "0")}`;
+  // US format M/D/YYYY or M/D/YY
+  const us = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (us) {
+    let [, m, d, y] = us;
+    if (y.length === 2) y = (parseInt(y, 10) > 50 ? "19" : "20") + y;
+    return `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+  }
+  // Fallback: Date.parse
+  const ts = Date.parse(s);
+  if (!Number.isNaN(ts)) {
+    const dt = new Date(ts);
+    return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+  }
+  return s.slice(0, 10);
+}
+
+// Normalize a time string to HH:MM (24-hour).
+// Handles: 09:31, 9:31, 09:31:00, 9:31 AM, 14:31, 14:31:22
+function normalizeTime(raw) {
+  if (!raw) return "00:00";
+  const s = String(raw).trim();
+  // 24-hour with optional seconds
+  const m24 = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  if (m24) return `${m24[1].padStart(2, "0")}:${m24[2]}`;
+  // 12-hour with AM/PM
+  const m12 = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM|am|pm)$/);
+  if (m12) {
+    let h = parseInt(m12[1], 10);
+    const pm = /pm/i.test(m12[3]);
+    if (pm && h < 12) h += 12;
+    if (!pm && h === 12) h = 0;
+    return `${String(h).padStart(2, "0")}:${m12[2]}`;
+  }
+  return s.slice(0, 5);
+}
+
 function rowToTrade(row, idx) {
   const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
   const get = (...keys) => {
@@ -105,11 +149,14 @@ function rowToTrade(row, idx) {
     const n = parseFloat(String(v).replace(/[$,]/g, ""));
     return Number.isFinite(n) ? n : 0;
   };
-  const entryTime = get("entry_time", "entrytime", "time");
+  const dateStr = normalizeDate(get("date"));
+  const timeStr = normalizeTime(get("entry_time", "entrytime", "time"));
   return {
     id: idx,
-    date: String(get("date")).slice(0, 10),
-    time: String(entryTime).slice(0, 5) || "00:00",
+    date: dateStr,
+    time: timeStr,
+    // Sortable: a single timestamp in ms since epoch. Used throughout for sorting/filtering.
+    ts: Date.parse(`${dateStr}T${timeStr}:00`) || 0,
     ticker: String(get("symbol", "ticker")).trim(),
     mode: String(get("mode", "strategy")).trim() || "—",
     setup: String(get("setup")).trim() || "—",
@@ -190,6 +237,7 @@ function Dashboard() {
   const [dataSource, setDataSource] = useState("sample"); // sample | csv | sheets
   const [tickerFilter, setTickerFilter] = useState("ALL");
   const [strategyFilter, setStrategyFilter] = useState("ALL");
+  const [dateRange, setDateRange] = useState("ALL"); // ALL | TODAY | YESTERDAY | WEEK | MONTH
   const [sheetsUrl, setSheetsUrl] = useState("");
   const [linkedUrl, setLinkedUrl] = useState(""); // URL currently linked for refresh
   const [loadMsg, setLoadMsg] = useState("");
@@ -198,6 +246,8 @@ function Dashboard() {
   const [showImport, setShowImport] = useState(false);
   const [lastRefresh, setLastRefresh] = useState(null);
   const [autoRefresh, setAutoRefresh] = useState(false);
+  // Trade log sort: key is column, dir is "asc"|"desc". Default: most recent first.
+  const [sortBy, setSortBy] = useState({ key: "ts", dir: "desc" });
   const fileRef = useRef(null);
 
   // Restore linked URL from localStorage
@@ -214,19 +264,78 @@ function Dashboard() {
     return { allTickers: [...t].sort(), allStrategies: [...s].sort() };
   }, [trades]);
 
+  // Anchor date ranges on the most recent trade date in the dataset
+  // (so TODAY/WEEK/MONTH are meaningful on weekends when markets are closed).
+  const anchorDate = useMemo(() => {
+    if (!trades.length) return new Date();
+    const maxTs = Math.max(...trades.map(t => t.ts || 0));
+    return maxTs ? new Date(maxTs) : new Date();
+  }, [trades]);
+
+  // Return inclusive start-of-day timestamp for a range relative to anchorDate
+  const rangeStartMs = useMemo(() => {
+    const d = new Date(anchorDate);
+    d.setHours(0, 0, 0, 0);
+    if (dateRange === "TODAY")     return d.getTime();
+    if (dateRange === "YESTERDAY") return d.getTime() - 86400_000;
+    if (dateRange === "WEEK")      return d.getTime() - 6 * 86400_000; // last 7 days inclusive
+    if (dateRange === "MONTH")     return d.getTime() - 29 * 86400_000; // last 30 days inclusive
+    return null; // ALL
+  }, [anchorDate, dateRange]);
+
+  const rangeEndMs = useMemo(() => {
+    if (dateRange !== "YESTERDAY") return null; // no upper bound for other ranges
+    const d = new Date(anchorDate);
+    d.setHours(0, 0, 0, 0);
+    return d.getTime(); // yesterday = [yesterday 00:00, today 00:00)
+  }, [anchorDate, dateRange]);
+
   const filtered = useMemo(() => {
     return trades.filter(t => {
       if (tickerFilter !== "ALL" && t.ticker !== tickerFilter) return false;
       if (strategyFilter !== "ALL" && t.mode !== strategyFilter) return false;
+      if (rangeStartMs !== null && t.ts < rangeStartMs) return false;
+      if (rangeEndMs !== null && t.ts >= rangeEndMs) return false;
       if (search && !(`${t.ticker} ${t.setup} ${t.reason} ${t.mode}`.toLowerCase().includes(search.toLowerCase()))) return false;
       return true;
     });
-  }, [trades, tickerFilter, strategyFilter, search]);
+  }, [trades, tickerFilter, strategyFilter, rangeStartMs, rangeEndMs, search]);
 
   const sortedAsc = useMemo(
-    () => [...filtered].sort((a, b) => `${a.date} ${a.time}`.localeCompare(`${b.date} ${b.time}`)),
+    () => [...filtered].sort((a, b) => a.ts - b.ts),
     [filtered]
   );
+
+  // Sorted copy for the trade log — respects the user's column/direction pick.
+  const logSorted = useMemo(() => {
+    const { key, dir } = sortBy;
+    const mult = dir === "asc" ? 1 : -1;
+    const getVal = (t) => {
+      if (key === "ts") return t.ts;
+      if (key === "pnl") return t.pnl;
+      if (key === "entry") return t.entry;
+      if (key === "exit") return t.exit;
+      if (key === "qty") return t.qty;
+      // string columns
+      return String(t[key] || "").toLowerCase();
+    };
+    return [...filtered].sort((a, b) => {
+      const va = getVal(a), vb = getVal(b);
+      if (va < vb) return -1 * mult;
+      if (va > vb) return  1 * mult;
+      // Secondary sort: always break ties by timestamp desc so same-minute trades stay intuitive
+      return (b.ts - a.ts);
+    });
+  }, [filtered, sortBy]);
+
+  const toggleSort = (key) => {
+    setSortBy(prev => {
+      if (prev.key === key) return { key, dir: prev.dir === "asc" ? "desc" : "asc" };
+      // New column: pick a sensible default direction
+      const defaultDesc = ["ts", "pnl", "entry", "exit", "qty"].includes(key);
+      return { key, dir: defaultDesc ? "desc" : "asc" };
+    });
+  };
 
   const stats = useMemo(() => {
     const total = filtered.reduce((s, t) => s + t.pnl, 0);
@@ -296,10 +405,12 @@ function Dashboard() {
   const byStrategy = useMemo(() => groupBy(t => t.mode).sort((a, b) => b.pnl - a.pnl), [filtered]);
   const byReason   = useMemo(() => groupBy(t => t.reason || "—").sort((a, b) => b.trades - a.trades), [filtered]);
 
+  // "Latest day" = the date portion of the anchor (most recent trade timestamp)
   const mostRecentDate = useMemo(() => {
     if (!trades.length) return "";
-    return [...trades].map(t => t.date).sort().reverse()[0];
-  }, [trades]);
+    const d = anchorDate;
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  }, [trades, anchorDate]);
   const todayTrades = filtered.filter(t => t.date === mostRecentDate);
   const todayPnl = todayTrades.reduce((s, t) => s + t.pnl, 0);
   const todayWins = todayTrades.filter(t => t.pnl > 0).length;
@@ -400,7 +511,8 @@ function Dashboard() {
   const resetToSample = () => {
     setTrades(DEFAULT_TRADES); setDataSource("sample");
     setLoadState("idle"); setLoadMsg(""); setLastRefresh(null);
-    setTickerFilter("ALL"); setStrategyFilter("ALL"); setSearch("");
+    setTickerFilter("ALL"); setStrategyFilter("ALL"); setDateRange("ALL"); setSearch("");
+    setSortBy({ key: "ts", dir: "desc" });
   };
 
   // ─── Small pieces ───────────────────────────────────────────────────────
@@ -622,6 +734,22 @@ function Dashboard() {
         {/* Filter rows */}
         <div style={{ marginTop: "14px", display: "flex", flexDirection: "column", gap: "8px" }}>
           <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+            <div style={{ fontSize: "9px", letterSpacing: "2px", color: T.textFaint, width: "70px" }}>DATE</div>
+            {[
+              { key: "ALL",       label: "ALL" },
+              { key: "TODAY",     label: "TODAY" },
+              { key: "YESTERDAY", label: "YESTERDAY" },
+              { key: "WEEK",      label: "7D" },
+              { key: "MONTH",     label: "30D" },
+            ].map(r => {
+              const count = countInRange(trades, r.key, anchorDate);
+              return (
+                <Chip key={r.key} active={dateRange === r.key} onClick={() => setDateRange(r.key)}
+                  color={T.blueLi} count={count}>{r.label}</Chip>
+              );
+            })}
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
             <div style={{ fontSize: "9px", letterSpacing: "2px", color: T.textFaint, width: "70px" }}>TICKER</div>
             <Chip active={tickerFilter === "ALL"} onClick={() => setTickerFilter("ALL")} color={T.blueLi} count={trades.length}>ALL</Chip>
             {allTickers.map(t => (
@@ -775,20 +903,20 @@ function Dashboard() {
             <table style={{ width: "100%", fontSize: "11px", borderCollapse: "collapse", fontVariantNumeric: "tabular-nums" }}>
               <thead style={{ position: "sticky", top: 0, background: T.panelHi, zIndex: 1 }}>
                 <tr style={{ color: T.textDim, borderBottom: `1px solid ${T.border}` }}>
-                  <th style={thStyle}>Date / Time</th>
-                  <th style={thStyle}>Ticker</th>
-                  <th style={thStyle}>Strategy</th>
-                  <th style={thStyle}>Setup</th>
-                  <th style={{ ...thStyle, textAlign: "right" }}>Entry</th>
-                  <th style={{ ...thStyle, textAlign: "right" }}>Exit</th>
-                  <th style={{ ...thStyle, textAlign: "right" }}>Qty</th>
-                  <th style={{ ...thStyle, textAlign: "right" }}>P&amp;L</th>
-                  <th style={thStyle}>Reason</th>
+                  <SortTh label="Date / Time" col="ts"     sortBy={sortBy} onClick={toggleSort} />
+                  <SortTh label="Ticker"      col="ticker" sortBy={sortBy} onClick={toggleSort} />
+                  <SortTh label="Strategy"    col="mode"   sortBy={sortBy} onClick={toggleSort} />
+                  <SortTh label="Setup"       col="setup"  sortBy={sortBy} onClick={toggleSort} />
+                  <SortTh label="Entry"       col="entry"  sortBy={sortBy} onClick={toggleSort} align="right" />
+                  <SortTh label="Exit"        col="exit"   sortBy={sortBy} onClick={toggleSort} align="right" />
+                  <SortTh label="Qty"         col="qty"    sortBy={sortBy} onClick={toggleSort} align="right" />
+                  <SortTh label="P&L"         col="pnl"    sortBy={sortBy} onClick={toggleSort} align="right" />
+                  <SortTh label="Reason"      col="reason" sortBy={sortBy} onClick={toggleSort} />
                   <th style={{ ...thStyle, textAlign: "center" }}>R</th>
                 </tr>
               </thead>
               <tbody>
-                {[...filtered].sort((a, b) => `${b.date} ${b.time}`.localeCompare(`${a.date} ${a.time}`)).map(t => (
+                {logSorted.map(t => (
                   <tr key={t.id} style={{ borderBottom: "1px solid #0f172a" }}>
                     <td style={{ ...tdStyle, color: T.textMid }}>{t.date} <span style={{ color: T.textFaint }}>{t.time}</span></td>
                     <td style={{ ...tdStyle, fontWeight: 600, color: tickerColor(t.ticker) }}>{t.ticker}</td>
@@ -849,6 +977,22 @@ function formatQty(n) {
   return n.toFixed(3);
 }
 
+// Count trades within a named date range, anchored on the given date.
+// Keeps the date chip counts in sync with the filter logic.
+function countInRange(trades, range, anchorDate) {
+  if (range === "ALL") return trades.length;
+  const d = new Date(anchorDate);
+  d.setHours(0, 0, 0, 0);
+  const startOfDay = d.getTime();
+  let start, end = null;
+  if (range === "TODAY")          start = startOfDay;
+  else if (range === "YESTERDAY") { start = startOfDay - 86400_000; end = startOfDay; }
+  else if (range === "WEEK")      start = startOfDay - 6 * 86400_000;
+  else if (range === "MONTH")     start = startOfDay - 29 * 86400_000;
+  else return trades.length;
+  return trades.filter(t => t.ts >= start && (end === null || t.ts < end)).length;
+}
+
 // Self-contained: only this component re-renders each second, not the whole dashboard.
 // This keeps Recharts from replaying its entry animation 60 times per minute.
 function TimeAgo({ ts }) {
@@ -867,6 +1011,36 @@ function TimeAgo({ ts }) {
     else text = `${Math.floor(m / 60)}h ${m % 60}m ago`;
   }
   return <span>{text}</span>;
+}
+
+// Clickable sortable table header. Shows arrow indicator for the active column.
+function SortTh({ label, col, sortBy, onClick, align = "left" }) {
+  const active = sortBy.key === col;
+  const arrow = active ? (sortBy.dir === "asc" ? "↑" : "↓") : "";
+  return (
+    <th
+      onClick={() => onClick(col)}
+      style={{
+        ...thStyle,
+        textAlign: align,
+        cursor: "pointer",
+        userSelect: "none",
+        color: active ? "#e4e9f0" : undefined,
+        transition: "color 120ms ease",
+      }}
+      title={`Sort by ${label}`}
+    >
+      <span style={{ display: "inline-flex", alignItems: "center", gap: "4px", justifyContent: align === "right" ? "flex-end" : align === "center" ? "center" : "flex-start", width: "100%" }}>
+        {label}
+        <span style={{
+          fontSize: "10px",
+          color: active ? "#60a5fa" : "#334155",
+          width: "8px",
+          display: "inline-block",
+        }}>{arrow || "·"}</span>
+      </span>
+    </th>
+  );
 }
 
 function BreakdownTable({ rows, colorFn }) {
