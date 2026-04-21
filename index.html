@@ -38,7 +38,8 @@
 const { useState, useMemo, useRef, useEffect, useCallback } = React;
 const {
   XAxis, YAxis, Tooltip, ResponsiveContainer,
-  BarChart, Bar, Cell, CartesianGrid, Area, AreaChart, ReferenceLine
+  BarChart, Bar, Cell, CartesianGrid, Area, AreaChart, ReferenceLine,
+  ScatterChart, Scatter, ZAxis
 } = Recharts;
 
 // ─── Sample data (used until the user imports real trades) ──────────────────
@@ -115,22 +116,26 @@ function normalizeDate(raw) {
   return s.slice(0, 10);
 }
 
-// Normalize a time string to HH:MM (24-hour).
+// Normalize a time string to HH:MM[:SS] (24-hour). Seconds preserved when present.
 // Handles: 09:31, 9:31, 09:31:00, 9:31 AM, 14:31, 14:31:22
 function normalizeTime(raw) {
   if (!raw) return "00:00";
   const s = String(raw).trim();
   // 24-hour with optional seconds
-  const m24 = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
-  if (m24) return `${m24[1].padStart(2, "0")}:${m24[2]}`;
+  const m24 = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (m24) {
+    const base = `${m24[1].padStart(2, "0")}:${m24[2]}`;
+    return m24[3] ? `${base}:${m24[3]}` : base;
+  }
   // 12-hour with AM/PM
-  const m12 = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM|am|pm)$/);
+  const m12 = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM|am|pm)$/);
   if (m12) {
     let h = parseInt(m12[1], 10);
-    const pm = /pm/i.test(m12[3]);
+    const pm = /pm/i.test(m12[4]);
     if (pm && h < 12) h += 12;
     if (!pm && h === 12) h = 0;
-    return `${String(h).padStart(2, "0")}:${m12[2]}`;
+    const base = `${String(h).padStart(2, "0")}:${m12[2]}`;
+    return m12[3] ? `${base}:${m12[3]}` : base;
   }
   return s.slice(0, 5);
 }
@@ -156,7 +161,8 @@ function rowToTrade(row, idx) {
     date: dateStr,
     time: timeStr,
     // Sortable: a single timestamp in ms since epoch. Used throughout for sorting/filtering.
-    ts: Date.parse(`${dateStr}T${timeStr}:00`) || 0,
+    // timeStr may be HH:MM or HH:MM:SS — ISO parser needs seconds, so append :00 if missing.
+    ts: Date.parse(`${dateStr}T${timeStr.length === 5 ? timeStr + ":00" : timeStr}`) || 0,
     ticker: String(get("symbol", "ticker")).trim(),
     mode: String(get("mode", "strategy")).trim() || "—",
     setup: String(get("setup")).trim() || "—",
@@ -248,6 +254,8 @@ function Dashboard() {
   const [autoRefresh, setAutoRefresh] = useState(false);
   // Trade log sort: key is column, dir is "asc"|"desc". Default: most recent first.
   const [sortBy, setSortBy] = useState({ key: "ts", dir: "desc" });
+  // Time scatter chart: display trade results as $ or % of entry value
+  const [scatterUnit, setScatterUnit] = useState("dollar"); // "dollar" | "percent"
   const fileRef = useRef(null);
 
   // Restore linked URL from localStorage
@@ -391,6 +399,52 @@ function Dashboard() {
       label: `${String(r.hour).padStart(2, "0")}:00`
     }));
   }, [filtered]);
+
+  // Break-even threshold: trades within this $ magnitude count as break-even (amber).
+  // Small enough that real wins/losses stand out, large enough to catch rounding noise.
+  const BE_THRESHOLD_USD = 0.50;
+
+  // Scatter points for the time-of-day chart. X is hour-of-day in ET as a decimal (e.g. 9.517 = 09:31).
+  // Y is either dollar P&L or percent of entry cost, user-selectable.
+  const timeScatter = useMemo(() => {
+    return filtered.map(t => {
+      const [hh, mm, ss = "0"] = (t.time || "00:00").split(":");
+      const hourOfDay = (parseInt(hh, 10) || 0) + (parseInt(mm, 10) || 0) / 60 + (parseInt(ss, 10) || 0) / 3600;
+      const cost = (t.entry || 0) * (t.qty || 0);
+      const pct = cost > 0 ? (t.pnl / cost) * 100 : 0;
+      // Categorize: amber for break-even, green/red for winners/losers
+      let category;
+      if (Math.abs(t.pnl) < BE_THRESHOLD_USD) category = "be";
+      else if (t.pnl > 0) category = "win";
+      else category = "loss";
+      return {
+        x: hourOfDay,
+        pnlDollar: +t.pnl.toFixed(2),
+        pnlPercent: +pct.toFixed(3),
+        category,
+        // Fields below are used only for tooltip display
+        ticker: t.ticker,
+        mode: t.mode,
+        setup: t.setup,
+        date: t.date,
+        time: t.time,
+        id: t.id,
+      };
+    });
+  }, [filtered]);
+
+  // Partition for separate Scatter series so each gets its own legend color
+  const scatterSeries = useMemo(() => ({
+    wins:   timeScatter.filter(p => p.category === "win"),
+    losses: timeScatter.filter(p => p.category === "loss"),
+    be:     timeScatter.filter(p => p.category === "be"),
+  }), [timeScatter]);
+
+  const scatterYKey = scatterUnit === "percent" ? "pnlPercent" : "pnlDollar";
+  const scatterYFmt = (v) => {
+    if (scatterUnit === "percent") return `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`;
+    return `${v >= 0 ? "+" : "−"}$${Math.abs(v).toFixed(2)}`;
+  };
 
   const groupBy = (keyFn) => {
     const m = {};
@@ -880,6 +934,119 @@ function Dashboard() {
           </Panel>
         </div>
 
+        {/* Time-of-day scatter: each dot is one trade, X=hour-of-day ET, Y=result */}
+        <Panel
+          title={`TRADE RESULTS BY TIME OF DAY · ${timeScatter.length} trades`}
+          right={
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              {/* Legend */}
+              <div style={{ display: "inline-flex", gap: "10px", fontSize: "9.5px", color: T.textDim, letterSpacing: "1px" }}>
+                <span style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+                  <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: T.green, display: "inline-block" }} />
+                  WIN {scatterSeries.wins.length}
+                </span>
+                <span style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+                  <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: T.amber, display: "inline-block" }} />
+                  BE {scatterSeries.be.length}
+                </span>
+                <span style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+                  <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: T.red, display: "inline-block" }} />
+                  LOSS {scatterSeries.losses.length}
+                </span>
+              </div>
+              {/* $/% toggle */}
+              <div style={{ display: "inline-flex", border: `1px solid ${T.border}`, borderRadius: "6px", overflow: "hidden" }}>
+                {["dollar", "percent"].map(u => (
+                  <button
+                    key={u}
+                    onClick={() => setScatterUnit(u)}
+                    style={{
+                      padding: "4px 10px", fontSize: "10px",
+                      background: scatterUnit === u ? T.borderHi : "transparent",
+                      color: scatterUnit === u ? T.text : T.textDim,
+                      border: "none", cursor: "pointer", letterSpacing: "1px",
+                    }}
+                  >
+                    {u === "dollar" ? "$" : "%"}
+                  </button>
+                ))}
+              </div>
+            </div>
+          }
+          style={{ marginBottom: "16px" }}
+        >
+          {timeScatter.length ? (
+            <ResponsiveContainer width="100%" height={280}>
+              <ScatterChart margin={{ top: 8, right: 16, left: -4, bottom: 8 }}>
+                <CartesianGrid strokeDasharray="2 4" stroke={T.border} />
+                <XAxis
+                  type="number"
+                  dataKey="x"
+                  domain={[0, 24]}
+                  ticks={[0, 2, 4, 6, 8, 9.5, 12, 14, 16, 18, 20, 22, 24]}
+                  tick={{ fill: T.textFaint, fontSize: 10 }}
+                  axisLine={{ stroke: T.border }}
+                  tickLine={{ stroke: T.border }}
+                  tickFormatter={(v) => {
+                    const h = Math.floor(v);
+                    const m = Math.round((v - h) * 60);
+                    return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+                  }}
+                  label={{ value: "Time of day (ET)", position: "insideBottom", offset: -4, fill: T.textDim, fontSize: 10, letterSpacing: "1px" }}
+                />
+                <YAxis
+                  type="number"
+                  dataKey={scatterYKey}
+                  tick={{ fill: T.textFaint, fontSize: 10 }}
+                  axisLine={{ stroke: T.border }}
+                  tickLine={{ stroke: T.border }}
+                  tickFormatter={(v) => scatterUnit === "percent" ? `${v}%` : `$${v}`}
+                />
+                <ZAxis range={[50, 50]} />
+                <Tooltip
+                  cursor={{ strokeDasharray: "3 3", stroke: T.borderHi }}
+                  contentStyle={{
+                    background: "#0f172aee", border: `1px solid ${T.borderHi}`,
+                    borderRadius: "6px", fontSize: "11px", color: T.text,
+                  }}
+                  content={({ active, payload }) => {
+                    if (!active || !payload || !payload.length) return null;
+                    const p = payload[0].payload;
+                    return (
+                      <div style={{
+                        background: "#0f172aee", border: `1px solid ${T.borderHi}`,
+                        borderRadius: "6px", padding: "8px 10px", fontSize: "11px",
+                        fontFamily: T.mono, color: T.text, minWidth: "180px",
+                      }}>
+                        <div style={{ color: T.textDim, fontSize: "9.5px", letterSpacing: "1px", marginBottom: "4px" }}>
+                          {p.date} {p.time} ET
+                        </div>
+                        <div style={{ fontWeight: 600, color: tickerColor(p.ticker), marginBottom: "2px" }}>
+                          {p.ticker} <span style={{ color: modeColor(p.mode), fontSize: "10px" }}>· {p.mode}</span>
+                        </div>
+                        <div style={{ color: T.textMid, fontSize: "10px", marginBottom: "4px" }}>{p.setup}</div>
+                        <div style={{ fontWeight: 700, color: p.pnlDollar > 0 ? T.green : p.pnlDollar < 0 ? T.red : T.amber }}>
+                          {p.pnlDollar >= 0 ? "+" : "−"}${Math.abs(p.pnlDollar).toFixed(2)}
+                          <span style={{ color: T.textDim, fontWeight: 400, marginLeft: "6px", fontSize: "10px" }}>
+                            ({p.pnlPercent >= 0 ? "+" : ""}{p.pnlPercent.toFixed(2)}%)
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  }}
+                />
+                {/* Reference lines: zero (breakeven), market open (9:30 ET), market close (16:00 ET) */}
+                <ReferenceLine y={0} stroke={T.borderHi} strokeDasharray="2 2" />
+                <ReferenceLine x={9.5}  stroke={T.textFaint} strokeDasharray="2 4" label={{ value: "open", position: "top", fill: T.textFaint, fontSize: 9 }} />
+                <ReferenceLine x={16}   stroke={T.textFaint} strokeDasharray="2 4" label={{ value: "close", position: "top", fill: T.textFaint, fontSize: 9 }} />
+                <Scatter data={scatterSeries.wins}   fill={T.green} fillOpacity={0.85} stroke={T.green} strokeWidth={1} />
+                <Scatter data={scatterSeries.be}     fill={T.amber} fillOpacity={0.85} stroke={T.amber} strokeWidth={1} />
+                <Scatter data={scatterSeries.losses} fill={T.red}   fillOpacity={0.85} stroke={T.red}   strokeWidth={1} />
+              </ScatterChart>
+            </ResponsiveContainer>
+          ) : <div style={{ color: T.textFaint, fontSize: "11px", padding: "20px 0", textAlign: "center" }}>No trades in this range.</div>}
+        </Panel>
+
         {/* Breakdown tables */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "10px", marginBottom: "16px" }}>
           <Panel title="BY STRATEGY"><BreakdownTable rows={byStrategy} colorFn={modeColor} /></Panel>
@@ -918,7 +1085,10 @@ function Dashboard() {
               <tbody>
                 {logSorted.map(t => (
                   <tr key={t.id} style={{ borderBottom: "1px solid #0f172a" }}>
-                    <td style={{ ...tdStyle, color: T.textMid }}>{t.date} <span style={{ color: T.textFaint }}>{t.time}</span></td>
+                    <td style={{ ...tdStyle, color: T.textMid, whiteSpace: "nowrap" }}>
+                      {t.date} <span style={{ color: T.textFaint }}>{t.time}</span>
+                      <span style={{ color: T.textFaint, fontSize: "9px", marginLeft: "3px" }}>ET</span>
+                    </td>
                     <td style={{ ...tdStyle, fontWeight: 600, color: tickerColor(t.ticker) }}>{t.ticker}</td>
                     <td style={tdStyle}>
                       <span style={{
