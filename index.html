@@ -176,6 +176,65 @@ function normalizeTime(raw) {
   return "00:00"; // Unrecognized — fail safely to midnight instead of junk string
 }
 
+// ─── Strategy family normalization ────────────────────────────────────────
+// The bot went through several generations of strategy tagging. Older rows in
+// the sheet use free-form values like "SOXL_5M", "TRENDING_BULL", "ETH_RSI_PB",
+// "DOGE_RSI", "HA_SCALP", etc. The current bot emits clean indicator families:
+// "EMA Cross", "RSI", "ORB", "Heikin Ashi", "MACD", "Other".
+//
+// This function maps any mode string — new or historical — to a canonical
+// family for the dashboard's filter chips, so you can click "RSI" and get
+// RSI trades regardless of which bot version tagged them.
+//
+// Resolution order:
+//   1. If the mode is already a canonical family, return it unchanged.
+//   2. Otherwise infer from the setup (the indicator name is usually there).
+//   3. Otherwise infer from the mode string itself via regex patterns.
+//   4. Fall back to "Other".
+const CANONICAL_FAMILIES = new Set([
+  "EMA Cross", "RSI", "ORB", "Heikin Ashi", "MACD", "Other",
+]);
+
+function normalizeStrategy(mode, setup) {
+  const modeStr  = String(mode || "").trim();
+  const setupStr = String(setup || "").trim().toUpperCase();
+
+  // Step 1: already canonical? done.
+  if (CANONICAL_FAMILIES.has(modeStr)) return modeStr;
+
+  // Step 2: infer from the setup column (most reliable for historical rows)
+  if (setupStr.startsWith("EMA"))        return "EMA Cross";
+  if (setupStr.startsWith("RSI"))        return "RSI";
+  if (setupStr.startsWith("ORB"))        return "ORB";
+  if (setupStr.startsWith("HA_") ||
+      setupStr.startsWith("HA "))        return "Heikin Ashi";
+  if (setupStr.includes("MACD"))         return "MACD";
+
+  // Step 3: infer from the mode string (regime labels, legacy tags, etc.)
+  const m = modeStr.toUpperCase();
+  if (!m || m === "—") return "Other";
+
+  // Indicator patterns come FIRST — these should win over the "Legacy" bucket
+  // for tags like "DOGE_EMA" or "ETH_RSI_PB" where the indicator is named.
+  // Note: \b won't trigger between an underscore and a letter (both are word
+  // chars in regex), so we use (?:^|[^A-Z]) / (?=[^A-Z]|$) boundaries instead.
+  if (/(?:^|[^A-Z])EMA(?:[^A-Z]|$)|CROSS|STRATEGY\s*D/.test(m))   return "EMA Cross";
+  if (/(?:^|[^A-Z])RSI(?:[^A-Z]|$)|RSI_PB|PULLBACK/.test(m))      return "RSI";
+  if (/(?:^|[^A-Z])ORB(?:[^A-Z]|$)|BREAKOUT/.test(m))             return "ORB";
+  if (/(?:^|[^A-Z])HA(?:[^A-Z]|$)|SCALP|HEIKIN|DOJI/.test(m))     return "Heikin Ashi";
+  if (/(?:^|[^A-Z])MACD(?:[^A-Z]|$)/.test(m))                     return "MACD";
+
+  // Regime labels (RANGE_BULL, TRENDING_BULL, BEAR): the actual trigger was
+  // always EMA or RSI, but we can't tell from just the mode — label as Legacy
+  // so the user can spot them and decide whether to dig in.
+  if (/RANGE_BULL|TRENDING_BULL|BEAR|REGIME/.test(m)) return "Legacy";
+
+  // Generic legacy patterns (SOXL_5M, SOXL_SEC, PB_1M, etc.)
+  if (/PB_?1M|PB_LONG|SOXL_SEC|_5M\b|_SEC\b|_PB\b/.test(m)) return "Legacy";
+
+  return "Other";
+}
+
 function rowToTrade(row, idx) {
   const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
   const get = (...keys) => {
@@ -213,6 +272,10 @@ function rowToTrade(row, idx) {
     return "";
   };
 
+  const rawMode  = String(get("mode", "strategy")).trim();
+  const rawSetup = String(get("setup")).trim();
+  const family   = normalizeStrategy(rawMode, rawSetup);
+
   return {
     id: idx,
     date: dateStr,
@@ -220,8 +283,9 @@ function rowToTrade(row, idx) {
     // timeStr may be HH:MM or HH:MM:SS — ISO parser needs seconds, so append :00 if missing.
     ts: Date.parse(`${dateStr}T${timeStr.length === 5 ? timeStr + ":00" : timeStr}`) || 0,
     ticker: String(get("symbol", "ticker")).trim(),
-    mode: String(get("mode", "strategy")).trim() || "—",
-    setup: String(get("setup")).trim() || "—",
+    mode: family,                          // canonical family for filter chips
+    modeRaw: rawMode || "—",               // original value preserved for tooltips/debug
+    setup: rawSetup || "—",
     entry: num(get("entry_price", "entry$", "entry")),
     exit:  num(get("exit_price", "exit$", "exit")),
     qty:   num(get("qty", "quantity")),
@@ -281,11 +345,16 @@ function csvToOpenPositions(text) {
     const uPnlDollar = num(pickField(/p.?l.*\$|pnl.*\$|unrealized.*\$/i, "unrealizedpl", "pnl"));
     const uPnlPct    = num(pickField(/p.?l.*%|pnl.*%|unrealized.*%/i, "unrealizedplpercent", "pct"));
 
+    const rawMode  = String(get("mode", "strategy")).trim();
+    const rawSetup = String(get("setup")).trim();
+    const family   = normalizeStrategy(rawMode, rawSetup);
+
     return {
       id: i,
       ticker:       String(get("ticker", "symbol")).trim(),
-      mode:         String(get("mode", "strategy")).trim() || "—",
-      setup:        String(get("setup")).trim(),
+      mode:         family || "—",
+      modeRaw:      rawMode || "—",
+      setup:        rawSetup,
       entryTime:    String(get("entry_time", "entrytime", "entry_time_et")).trim(),
       entryPrice:   num(get("entry_price", "entry$", "entry")),
       currentPrice: num(get("current_price", "current$", "current")),
