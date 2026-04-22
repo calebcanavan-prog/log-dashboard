@@ -199,6 +199,13 @@ function normalizeStrategy(mode, setup) {
   const modeStr  = String(mode || "").trim();
   const setupStr = String(setup || "").trim().toUpperCase();
 
+  // Step 0: Recovered/adopted positions — these get picked up at bot startup
+  // (or when Alpaca has a position the bot didn't remember). The bot tags them
+  // with mode="MACD" because strategy_family("recovered") → "MACD", but that's
+  // misleading: a recovered DOGE or SOL EMA trade isn't MACD-based. Map these
+  // to a dedicated "Recovered" bucket so they don't pollute the MACD numbers.
+  if (setupStr === "RECOVERED" || setupStr === "ADOPTED") return "Recovered";
+
   // Step 1: already canonical? done.
   if (CANONICAL_FAMILIES.has(modeStr)) return modeStr;
 
@@ -792,13 +799,16 @@ function Dashboard() {
     try { localStorage.removeItem(LS_URL_POS); } catch (e) {}
   };
 
-  // Auto-refresh timer — also picks up position changes
+  // Auto-refresh timer — also picks up position changes.
+  // 15s cadence: twice as frequent as the bot's 30s position push, so live
+  // unrealized P&L stays near-current without hammering Google Sheets
+  // (published-to-web CSV is CDN-cached for ~60s anyway).
   useEffect(() => {
     if (!autoRefresh || !linkedUrl) return;
     const id = setInterval(() => {
       fetchFromSheets(linkedUrl, { silent: true });
       if (linkedPosUrl) fetchPositions(linkedPosUrl);
-    }, 60_000);
+    }, 15_000);
     return () => clearInterval(id);
   }, [autoRefresh, linkedUrl, linkedPosUrl, fetchFromSheets, fetchPositions]);
 
