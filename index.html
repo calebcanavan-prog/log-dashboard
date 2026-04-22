@@ -66,6 +66,7 @@ const DEFAULT_TRADES = [
 ].map(t => ({ ...t, ts: Date.parse(`${t.date}T${t.time}:00`) || 0 }));
 
 const LS_URL = "alpha_hunter_sheets_url";
+const LS_URL_POS = "alpha_hunter_positions_url";
 
 // ─── Tiny CSV parser that handles quoted fields with commas ────────────────
 function parseCSV(text) {
@@ -247,6 +248,61 @@ function csvToTrades(text) {
   return { trades, skipped };
 }
 
+// Parser for the "Open Positions" sheet tab. Schema is simpler than trades:
+// no historical ts needed, no exit price, but carries unrealized P&L and age.
+function csvToOpenPositions(text) {
+  const rows = parseCSV(text).filter(r => r.some(c => c && c.trim() !== ""));
+  if (rows.length < 2) return [];
+  const headers = rows[0].map(h => h.trim());
+  const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
+  const num = (v) => {
+    const n = parseFloat(String(v).replace(/[$,]/g, ""));
+    return Number.isFinite(n) ? n : 0;
+  };
+
+  return rows.slice(1).map((r, i) => {
+    const obj = {};
+    headers.forEach((h, j) => { obj[h] = r[j] != null ? r[j].trim() : ""; });
+    const get = (...keys) => {
+      for (const k of keys) {
+        const nk = norm(k);
+        const match = Object.keys(obj).find(rk => norm(rk) === nk);
+        if (match && obj[match] != null && obj[match] !== "") return obj[match];
+      }
+      return "";
+    };
+
+    // Same P&L disambiguation trick as the trade log: prefer the $ column over %
+    const pickField = (regex, ...fallbackKeys) => {
+      const k = Object.keys(obj).find(h => regex.test(h));
+      if (k && obj[k] !== "") return obj[k];
+      return get(...fallbackKeys);
+    };
+    const uPnlDollar = num(pickField(/p.?l.*\$|pnl.*\$|unrealized.*\$/i, "unrealizedpl", "pnl"));
+    const uPnlPct    = num(pickField(/p.?l.*%|pnl.*%|unrealized.*%/i, "unrealizedplpercent", "pct"));
+
+    return {
+      id: i,
+      ticker:       String(get("ticker", "symbol")).trim(),
+      mode:         String(get("mode", "strategy")).trim() || "—",
+      setup:        String(get("setup")).trim(),
+      entryTime:    String(get("entry_time", "entrytime", "entry_time_et")).trim(),
+      entryPrice:   num(get("entry_price", "entry$", "entry")),
+      currentPrice: num(get("current_price", "current$", "current")),
+      qty:          num(get("qty", "quantity")),
+      cost:         num(get("cost$", "cost")),
+      uPnl:         uPnlDollar,
+      uPnlPct:      uPnlPct,
+      stop:         num(get("stop_price", "stop$", "stop")),
+      target:       num(get("target_price", "target$", "target")),
+      trailing:     num(get("trailing_stop$", "trailingstop", "trailing")),
+      beMoved:      /yes|true|1/i.test(String(get("be_moved", "bemoved"))),
+      ageMin:       num(get("age_min", "ageminutes", "age")),
+      updatedEt:    String(get("updated_et", "updatedet", "updated")).trim(),
+    };
+  }).filter(p => p.ticker); // drop blank rows
+}
+
 function toSheetsCsvUrl(url) {
   const u = url.trim();
   // Case 1: already a published CSV (File → Publish to web → CSV). Pass through.
@@ -308,6 +364,10 @@ function Dashboard() {
   const [dateRange, setDateRange] = useState("ALL"); // ALL | TODAY | YESTERDAY | WEEK | MONTH
   const [sheetsUrl, setSheetsUrl] = useState("");
   const [linkedUrl, setLinkedUrl] = useState(""); // URL currently linked for refresh
+  // Open Positions: second sheet tab URL + parsed positions
+  const [positionsUrl, setPositionsUrl] = useState("");
+  const [linkedPosUrl, setLinkedPosUrl] = useState("");
+  const [openPositions, setOpenPositions] = useState([]);
   const [loadMsg, setLoadMsg] = useState("");
   const [loadState, setLoadState] = useState("idle"); // idle | loading | ok | error
   const [search, setSearch] = useState("");
@@ -320,11 +380,13 @@ function Dashboard() {
   const [scatterUnit, setScatterUnit] = useState("dollar"); // "dollar" | "percent"
   const fileRef = useRef(null);
 
-  // Restore linked URL from localStorage
+  // Restore both linked URLs from localStorage
   useEffect(() => {
     try {
       const saved = localStorage.getItem(LS_URL);
       if (saved) { setSheetsUrl(saved); setLinkedUrl(saved); }
+      const savedPos = localStorage.getItem(LS_URL_POS);
+      if (savedPos) { setPositionsUrl(savedPos); setLinkedPosUrl(savedPos); }
     } catch (e) { /* no localStorage in this context */ }
   }, []);
 
@@ -612,9 +674,43 @@ function Dashboard() {
     }
   };
 
+  // Fetch the Open Positions tab. Silent mode avoids flashing the top-level
+  // loadMsg since positions update frequently and the existing "Loaded 82 trades"
+  // banner shouldn't be stomped on.
+  const fetchPositions = useCallback(async (url) => {
+    if (!url) return;
+    try {
+      const csvUrl = toSheetsCsvUrl(url.trim());
+      const busted = csvUrl + (csvUrl.includes("?") ? "&" : "?") + "_t=" + Date.now();
+      const res = await fetch(busted, { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      if (text.includes("<!DOCTYPE html>") || text.includes("<html")) {
+        // Positions tab isn't published — clear silently rather than alarming
+        setOpenPositions([]);
+        return;
+      }
+      setOpenPositions(csvToOpenPositions(text));
+    } catch (e) {
+      // Network hiccup — keep existing positions visible rather than clearing
+      console.warn("Positions fetch failed:", e.message);
+    }
+  }, []);
+
+  const linkPositions = async () => {
+    if (!positionsUrl.trim()) return;
+    await fetchPositions(positionsUrl);
+    setLinkedPosUrl(positionsUrl.trim());
+    try { localStorage.setItem(LS_URL_POS, positionsUrl.trim()); } catch (e) {}
+  };
+
   const refresh = async () => {
     if (!linkedUrl) { setShowImport(true); return; }
-    await fetchFromSheets(linkedUrl);
+    // Fetch trades and positions in parallel
+    await Promise.all([
+      fetchFromSheets(linkedUrl),
+      linkedPosUrl ? fetchPositions(linkedPosUrl) : Promise.resolve(),
+    ]);
   };
 
   const unlink = () => {
@@ -622,18 +718,33 @@ function Dashboard() {
     try { localStorage.removeItem(LS_URL); } catch (e) {}
   };
 
-  // Auto-refresh timer
+  const unlinkPositions = () => {
+    setLinkedPosUrl(""); setPositionsUrl(""); setOpenPositions([]);
+    try { localStorage.removeItem(LS_URL_POS); } catch (e) {}
+  };
+
+  // Auto-refresh timer — also picks up position changes
   useEffect(() => {
     if (!autoRefresh || !linkedUrl) return;
-    const id = setInterval(() => { fetchFromSheets(linkedUrl, { silent: true }); }, 60_000);
+    const id = setInterval(() => {
+      fetchFromSheets(linkedUrl, { silent: true });
+      if (linkedPosUrl) fetchPositions(linkedPosUrl);
+    }, 60_000);
     return () => clearInterval(id);
-  }, [autoRefresh, linkedUrl, fetchFromSheets]);
+  }, [autoRefresh, linkedUrl, linkedPosUrl, fetchFromSheets, fetchPositions]);
+
+  // On initial load, if a positions URL was restored from localStorage, fetch it
+  useEffect(() => {
+    if (linkedPosUrl) fetchPositions(linkedPosUrl);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [linkedPosUrl]);
 
   const resetToSample = () => {
     setTrades(DEFAULT_TRADES); setDataSource("sample");
     setLoadState("idle"); setLoadMsg(""); setLastRefresh(null);
     setTickerFilter("ALL"); setStrategyFilter("ALL"); setDateRange("ALL"); setSearch("");
     setSortBy({ key: "ts", dir: "desc" });
+    setOpenPositions([]);
   };
 
   // ─── Small pieces ───────────────────────────────────────────────────────
@@ -717,6 +828,15 @@ function Dashboard() {
               <span style={{ color: T.textFaint }}>· {trades.length} trades</span>
               {lastRefresh && dataSource === "sheets" && (
                 <span style={{ color: T.textFaint }}>· <TimeAgo ts={lastRefresh} /></span>
+              )}
+              {linkedPosUrl && openPositions.length > 0 && (
+                <span style={{
+                  color: T.amber, fontWeight: 600,
+                  borderLeft: `1px solid ${T.border}`,
+                  paddingLeft: "8px", marginLeft: "2px",
+                }}>
+                  ● {openPositions.length} open
+                </span>
               )}
             </div>
 
@@ -836,6 +956,44 @@ function Dashboard() {
                   <strong style={{ color: T.textMid }}>Recommended:</strong> in Sheets, File → Share → <strong style={{ color: T.textMid }}>Publish to web</strong> → select your Trades tab → CSV → Publish, then paste the <code style={{ color: T.textMid }}>/pub?...output=csv</code> URL here. A regular /edit URL will fail from file:// due to browser CORS.
                   {linkedUrl && " Once linked, use the ↻ REFRESH button to reload."}
                 </div>
+
+                {/* Optional: Open Positions tab (live, unrealized P&L) */}
+                <div style={{ marginTop: "14px", paddingTop: "12px", borderTop: `1px solid ${T.border}` }}>
+                  <div style={{ fontSize: "9.5px", letterSpacing: "2px", color: T.textDim, marginBottom: "8px" }}>
+                    OPEN POSITIONS TAB (OPTIONAL)
+                    {linkedPosUrl && <span style={{ color: T.green, marginLeft: "6px" }}>· LINKED</span>}
+                  </div>
+                  <div style={{ display: "flex", gap: "6px" }}>
+                    <input
+                      type="text" value={positionsUrl}
+                      onChange={e => setPositionsUrl(e.target.value)}
+                      placeholder="Paste the published URL for the Open Positions tab (different gid)"
+                      style={{
+                        flex: 1, padding: "8px 10px", fontSize: "10.5px",
+                        border: `1px solid ${T.border}`, background: T.bg,
+                        color: T.text, borderRadius: "6px", outline: "none",
+                      }}
+                    />
+                    <button onClick={linkPositions} style={{
+                      padding: "8px 14px", fontSize: "10.5px", border: `1px solid ${T.amber}`,
+                      background: `${T.amber}22`, color: T.amber, borderRadius: "6px",
+                      cursor: "pointer", letterSpacing: "1px", fontWeight: 600,
+                    }}>
+                      {linkedPosUrl ? "RELINK" : "LINK"}
+                    </button>
+                    {linkedPosUrl && (
+                      <button onClick={unlinkPositions} style={{
+                        padding: "8px 12px", fontSize: "10.5px", border: `1px solid ${T.border}`,
+                        background: "transparent", color: T.textMid, borderRadius: "6px", cursor: "pointer",
+                      }}>
+                        UNLINK
+                      </button>
+                    )}
+                  </div>
+                  <div style={{ fontSize: "9.5px", color: T.textFaint, marginTop: "6px", lineHeight: 1.5 }}>
+                    Requires the bot to write live positions to a second tab. See <code style={{ color: T.textMid }}>bot_patch.py</code> for the <code style={{ color: T.textMid }}>update_open_positions()</code> addition. Publish that tab the same way and paste its URL here.
+                  </div>
+                </div>
               </div>
             </div>
             {loadMsg && (
@@ -891,6 +1049,16 @@ function Dashboard() {
 
       {/* Body */}
       <div style={{ padding: "20px 24px" }}>
+        {/* Live Positions — only rendered when the Open Positions tab is linked */}
+        {linkedPosUrl && (
+          <LivePositionsPanel
+            positions={openPositions}
+            tickerColor={tickerColor}
+            modeColor={modeColor}
+            T={T}
+          />
+        )}
+
         {/* Hero metrics */}
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "10px", marginBottom: "16px" }}>
           {[
@@ -1311,6 +1479,244 @@ function BreakdownTable({ rows, colorFn }) {
         ))}
       </tbody>
     </table>
+  );
+}
+
+// ─── Live Positions Panel ──────────────────────────────────────────────────
+// Top-of-page card grid showing each currently-open position with live P&L.
+// Data comes from the bot writing state to a dedicated sheet tab every ~30s.
+function LivePositionsPanel({ positions, tickerColor, modeColor, T }) {
+  const total = positions.length;
+  const totalPnl = positions.reduce((s, p) => s + (p.uPnl || 0), 0);
+  const winning = positions.filter(p => p.uPnl > 0).length;
+
+  // Determine freshness — the bot writes "Updated ET" as HH:MM:SS each push
+  // so we can tell users when positions data was last refreshed by the bot
+  // (separate from when the dashboard last fetched the sheet).
+  const staleMin = (() => {
+    if (!positions.length) return null;
+    const latest = positions.map(p => p.updatedEt).filter(Boolean).sort().reverse()[0];
+    if (!latest) return null;
+    try {
+      const [h, m, s] = latest.split(":").map(Number);
+      const now = new Date();
+      const et = new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/New_York",
+        hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+      }).format(now).split(":").map(Number);
+      const updatedSec = h * 3600 + m * 60 + (s || 0);
+      const nowSec = et[0] * 3600 + et[1] * 60 + et[2];
+      // Handle day rollover: if "now" is earlier than "updated", the update was yesterday
+      const diff = (nowSec - updatedSec + 86400) % 86400;
+      return Math.floor(diff / 60);
+    } catch (e) { return null; }
+  })();
+
+  return (
+    <div style={{ marginBottom: "16px" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "10px" }}>
+        <div style={{ display: "inline-flex", alignItems: "center", gap: "10px" }}>
+          <span style={{
+            width: "8px", height: "8px", borderRadius: "50%",
+            background: total > 0 ? T.amber : T.textFaint,
+            boxShadow: total > 0 ? `0 0 10px ${T.amber}` : "none",
+          }} className={total > 0 ? "pulse" : ""} />
+          <span style={{ fontSize: "10px", letterSpacing: "2.5px", color: T.textMid, fontWeight: 600 }}>
+            LIVE POSITIONS
+          </span>
+          <span style={{ fontSize: "10px", color: T.textFaint }}>
+            {total === 0 ? "· flat" : `· ${total} open · ${winning}W`}
+          </span>
+          {total > 0 && (
+            <span style={{
+              fontSize: "11px", fontWeight: 700, letterSpacing: "0.5px",
+              fontVariantNumeric: "tabular-nums",
+              color: totalPnl > 0 ? T.green : totalPnl < 0 ? T.red : T.textMid,
+            }}>
+              {totalPnl >= 0 ? "+" : "−"}${Math.abs(totalPnl).toFixed(2)} unrealized
+            </span>
+          )}
+        </div>
+        {staleMin !== null && (
+          <span style={{ fontSize: "9.5px", color: staleMin > 5 ? T.amber : T.textFaint, letterSpacing: "1px" }}>
+            bot update: {staleMin === 0 ? "just now" : `${staleMin}m ago`}
+            {staleMin > 5 && " ⚠"}
+          </span>
+        )}
+      </div>
+
+      {total === 0 ? (
+        <div style={{
+          background: T.panelHi, border: `1px dashed ${T.border}`, borderRadius: "10px",
+          padding: "16px", textAlign: "center", color: T.textFaint, fontSize: "11px",
+          letterSpacing: "1px",
+        }}>
+          No positions currently open. The bot is flat.
+        </div>
+      ) : (
+        <div style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))",
+          gap: "10px",
+        }}>
+          {positions.map(p => <PositionCard key={p.id} p={p} tickerColor={tickerColor} modeColor={modeColor} T={T} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PositionCard({ p, tickerColor, modeColor, T }) {
+  const winning = p.uPnl > 0;
+  const losing = p.uPnl < 0;
+  const accent = winning ? T.green : losing ? T.red : T.amber;
+
+  // Stop / target / current price positions on a mini bar, for visual context
+  // Only show if we have both a stop and a sensible price range
+  const hasBar = p.stop && p.currentPrice && p.entryPrice;
+  const barMin = hasBar ? Math.min(p.stop, p.entryPrice, p.currentPrice, p.target || Infinity) : 0;
+  const barMax = hasBar ? Math.max(p.stop, p.entryPrice, p.currentPrice, p.target || 0) : 0;
+  const pct = (v) => hasBar && barMax > barMin ? ((v - barMin) / (barMax - barMin)) * 100 : 0;
+
+  return (
+    <div style={{
+      background: T.panelHi,
+      border: `1px solid ${accent}33`,
+      borderLeft: `3px solid ${accent}`,
+      borderRadius: "8px",
+      padding: "12px 14px",
+      position: "relative",
+      overflow: "hidden",
+    }}>
+      {/* Top row: ticker + strategy */}
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: "6px" }}>
+        <div style={{ display: "inline-flex", alignItems: "baseline", gap: "8px" }}>
+          <span style={{ fontSize: "14px", fontWeight: 700, color: tickerColor(p.ticker), letterSpacing: "0.5px" }}>
+            {p.ticker}
+          </span>
+          <span style={{
+            fontSize: "9px", fontWeight: 600, letterSpacing: "0.5px",
+            color: modeColor(p.mode), background: `${modeColor(p.mode)}18`,
+            padding: "2px 6px", borderRadius: "3px",
+          }}>
+            {p.mode}
+          </span>
+        </div>
+        <span style={{ fontSize: "9.5px", color: T.textFaint, letterSpacing: "0.5px" }}>
+          {p.setup}
+        </span>
+      </div>
+
+      {/* Main P&L display */}
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: "8px" }}>
+        <span style={{
+          fontSize: "20px", fontWeight: 700,
+          color: accent, fontVariantNumeric: "tabular-nums",
+        }}>
+          {p.uPnl >= 0 ? "+" : "−"}${Math.abs(p.uPnl).toFixed(2)}
+        </span>
+        <span style={{
+          fontSize: "11px", fontWeight: 500,
+          color: accent, fontVariantNumeric: "tabular-nums",
+        }}>
+          {p.uPnlPct >= 0 ? "+" : ""}{p.uPnlPct.toFixed(2)}%
+        </span>
+      </div>
+
+      {/* Price detail grid */}
+      <div style={{
+        display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 12px",
+        fontSize: "10px", color: T.textDim, marginBottom: hasBar ? "10px" : "4px",
+      }}>
+        <div>
+          <span style={{ color: T.textFaint }}>entry </span>
+          <span style={{ color: T.text, fontVariantNumeric: "tabular-nums" }}>
+            ${p.entryPrice < 1 ? p.entryPrice.toFixed(4) : p.entryPrice.toFixed(2)}
+          </span>
+        </div>
+        <div>
+          <span style={{ color: T.textFaint }}>now </span>
+          <span style={{ color: T.text, fontVariantNumeric: "tabular-nums", fontWeight: 600 }}>
+            ${p.currentPrice < 1 ? p.currentPrice.toFixed(4) : p.currentPrice.toFixed(2)}
+          </span>
+        </div>
+        <div>
+          <span style={{ color: T.textFaint }}>qty </span>
+          <span style={{ color: T.text, fontVariantNumeric: "tabular-nums" }}>
+            {p.qty >= 1000 ? p.qty.toLocaleString(undefined, { maximumFractionDigits: 0 }) :
+             p.qty >= 1 ? p.qty.toLocaleString(undefined, { maximumFractionDigits: 2 }) :
+             p.qty.toFixed(3)}
+          </span>
+        </div>
+        <div>
+          <span style={{ color: T.textFaint }}>age </span>
+          <span style={{ color: T.text, fontVariantNumeric: "tabular-nums" }}>
+            {p.ageMin ? `${p.ageMin}m` : "—"}
+          </span>
+        </div>
+        {p.stop > 0 && (
+          <div>
+            <span style={{ color: T.textFaint }}>stop </span>
+            <span style={{ color: T.red, fontVariantNumeric: "tabular-nums" }}>
+              ${p.stop < 1 ? p.stop.toFixed(4) : p.stop.toFixed(2)}
+            </span>
+          </div>
+        )}
+        {p.target > 0 && (
+          <div>
+            <span style={{ color: T.textFaint }}>target </span>
+            <span style={{ color: T.green, fontVariantNumeric: "tabular-nums" }}>
+              ${p.target < 1 ? p.target.toFixed(4) : p.target.toFixed(2)}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Mini price bar showing stop / entry / current / target positions */}
+      {hasBar && (
+        <div style={{ position: "relative", height: "4px", background: T.border, borderRadius: "2px", marginTop: "6px" }}>
+          {/* Stop marker */}
+          <div style={{
+            position: "absolute", left: `${pct(p.stop)}%`, top: "-2px",
+            width: "2px", height: "8px", background: T.red, borderRadius: "1px",
+            transform: "translateX(-50%)",
+          }} title={`stop $${p.stop.toFixed(2)}`} />
+          {/* Entry marker */}
+          <div style={{
+            position: "absolute", left: `${pct(p.entryPrice)}%`, top: "-2px",
+            width: "2px", height: "8px", background: T.textMid, borderRadius: "1px",
+            transform: "translateX(-50%)",
+          }} title={`entry $${p.entryPrice.toFixed(2)}`} />
+          {/* Current price — bigger marker */}
+          <div style={{
+            position: "absolute", left: `${pct(p.currentPrice)}%`, top: "-3px",
+            width: "8px", height: "10px", background: accent, borderRadius: "2px",
+            transform: "translateX(-50%)",
+            boxShadow: `0 0 6px ${accent}`,
+          }} title={`now $${p.currentPrice.toFixed(2)}`} />
+          {/* Target marker (if set) */}
+          {p.target > 0 && (
+            <div style={{
+              position: "absolute", left: `${pct(p.target)}%`, top: "-2px",
+              width: "2px", height: "8px", background: T.green, borderRadius: "1px",
+              transform: "translateX(-50%)",
+            }} title={`target $${p.target.toFixed(2)}`} />
+          )}
+        </div>
+      )}
+
+      {/* BE flag */}
+      {p.beMoved && (
+        <div style={{
+          position: "absolute", top: "8px", right: "8px",
+          fontSize: "8px", fontWeight: 700, letterSpacing: "1px",
+          color: T.amber, background: `${T.amber}18`,
+          padding: "2px 5px", borderRadius: "3px",
+        }}>
+          BE
+        </div>
+      )}
+    </div>
   );
 }
 
