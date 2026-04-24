@@ -283,12 +283,20 @@ function rowToTrade(row, idx) {
   const rawSetup = String(get("setup")).trim();
   const family   = normalizeStrategy(rawMode, rawSetup);
 
+  // Build the timestamp used for date-range filtering and sorting.
+  // normalizeTime() already guarantees the format is HH:MM or HH:MM:SS (or
+  // "00:00" for empty/unrecognized input), so we only need to handle the
+  // seconds suffix. This ensures recovered/migrated trades with no Entry Time
+  // land at midnight of their sheet date instead of epoch 1970 (which would
+  // make every date-range filter drop them).
+  const safeTime = timeStr.length === 5 ? timeStr + ":00" : timeStr;
+  const ts = Date.parse(`${dateStr}T${safeTime}`) || 0;
+
   return {
     id: idx,
     date: dateStr,
     time: timeStr,
-    // timeStr may be HH:MM or HH:MM:SS — ISO parser needs seconds, so append :00 if missing.
-    ts: Date.parse(`${dateStr}T${timeStr.length === 5 ? timeStr + ":00" : timeStr}`) || 0,
+    ts,
     ticker: String(get("symbol", "ticker")).trim(),
     mode: family,                          // canonical family for filter chips
     modeRaw: rawMode || "—",               // original value preserved for tooltips/debug
